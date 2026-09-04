@@ -15,16 +15,21 @@ Injector / HTTP Custom style) can contain multiple `\r\n\r\n` blocks, an
 `Expect: 100-continue` (client sends block 1, waits for a provisional reply,
 THEN sends block 2), and junk like a second `CONNECT ...` + `Content-length`.
 
-**Two rules that make arbitrary payloads work:**
+**Three rules that make arbitrary payloads work:**
 1. If the accumulated headers contain `100-continue`, send
    `HTTP/1.1 100 Continue\r\n\r\n` before the `101`, or two-stage clients hang.
 2. After sending the `101`, DO NOT immediately bridge the raw stream. Keep
    reading and **discard everything up to the `SSH-` banner**, then forward from
    `SSH-` onward. Every SSH client sends `SSH-2.0-...` as its first bytes, so it
    is a reliable delimiter between payload junk and the real SSH handshake.
+3. Start the backend-to-client direction immediately after `101`, while the
+   client-to-backend direction is still filtering payload junk. SSH peers may
+   both send identification first, but clients are allowed to wait for the
+   server identification; withholding OpenSSH's banner creates a deadlock.
 **Why:** with `Expect: 100-continue`, block 2 arrives AFTER the reply; if you
 bridge right after `101`, that block gets piped into SSH and corrupts the
 handshake — the symptom is "works for simple payloads, fails for this one".
-**How to apply:** keep the Go and Python proxies in lockstep; use a bounded read
-(timeout + size cap) when scanning for `SSH-` and fall back to an empty prefix so
-a missing banner never hangs the connection.
+**How to apply:** keep the Go and Python proxies in lockstep; start forwarding
+the backend banner after `101`, use a bounded read (timeout + size cap) when
+scanning client data for `SSH-`, and fall back to an empty prefix so a missing
+client banner never hangs the connection.

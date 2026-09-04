@@ -370,6 +370,13 @@ func handle(client net.Conn) {
 		return
 	}
 
+	// Start backend -> client now so the OpenSSH banner reaches clients that
+	// correctly wait for the server identification before sending theirs.
+	payloadDone := make(chan struct{}, 2)
+	go func() {
+		pipe(client, backend, payloadDone)
+	}()
+
 	// A payload may send SEVERAL HTTP blocks (e.g. a second CONNECT line, or a
 	// body it only sends after the 100/101 reply) before the real SSH stream.
 	// Forwarding that junk to SSH corrupts the handshake, so strip everything up
@@ -393,7 +400,17 @@ func handle(client net.Conn) {
 	if idx >= 0 {
 		prefix = buf[idx:] // forward from the SSH banner onward
 	}
-	bridge(client, backend, prefix)
+	if len(prefix) > 0 {
+		if _, err := backend.Write(prefix); err != nil {
+			client.Close()
+			backend.Close()
+			return
+		}
+	}
+	pipe(backend, client, payloadDone)
+	<-payloadDone
+	client.Close()
+	backend.Close()
 }
 
 func main() {
@@ -510,6 +527,11 @@ def handle(c):
         except Exception: pass
     try: c.sendall(RESP)
     except Exception: c.close(); b.close(); return
+    # Let the SSH server banner reach the client immediately. Waiting for the
+    # client's SSH identification first deadlocks clients that wait for the
+    # server banner, as required by normal SSH negotiation.
+    down=threading.Thread(target=pipe,args=(b,c),daemon=True)
+    down.start()
     # A payload may send more HTTP blocks (a second CONNECT line, or a body sent
     # only after the 100/101 reply) before the real SSH stream. Forwarding that
     # junk corrupts the SSH handshake, so strip everything up to the "SSH-"
@@ -527,7 +549,10 @@ def handle(c):
         try: c.settimeout(None)
         except Exception: pass
     pre=buf[idx:] if idx>=0 else b""
-    try: bridge(c,b,pre)
+    try:
+        if pre: b.sendall(pre)
+        pipe(c,b)
+        down.join()
     finally: c.close(); b.close()
 def main():
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
