@@ -14,3 +14,7 @@ an apt mirror or Certbot HTTP validation waits without a useful visible error.
 **How to apply:** keep certificate commands non-interactive and bounded, retain
 the existing domain-success behavior, and restart the WebSocket proxy before
 failing if even the local fallback cannot be generated.
+
+The following Stunnel phase must also be non-fatal. On re-runs, stop Xray only
+when it is confirmed to own TCP 443, make one bounded package retry if Stunnel
+is absent, and report restart failures without aborting later install phases.
