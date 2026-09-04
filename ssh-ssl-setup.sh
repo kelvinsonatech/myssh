@@ -90,6 +90,7 @@ phase() {  # phase "Title"
 CONF_DIR=/etc/ssh-panel
 mkdir -p "$CONF_DIR"
 STUNNEL_CERT=/etc/stunnel/stunnel.pem
+STUNNEL_KEY=/etc/stunnel/stunnel.key
 
 # ═══════════════════════════════════════════
 # ASK FOR DOMAIN
@@ -640,8 +641,8 @@ if [ -n "$DOMAIN" ]; then
 
     if [ "${LE_OK:-0}" -eq 1 ] && [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
         chmod -R 755 /etc/letsencrypt/archive /etc/letsencrypt/live
-        cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" \
-            "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$STUNNEL_CERT"
+        cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" > "$STUNNEL_CERT"
+        cat "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$STUNNEL_KEY"
         success "Let's Encrypt certificate obtained for $DOMAIN"
     else
         warn "Let's Encrypt failed — using self-signed certificate"
@@ -649,7 +650,7 @@ if [ -n "$DOMAIN" ]; then
     fi
 fi
 
-if [ -z "$DOMAIN" ] || [ ! -f "$STUNNEL_CERT" ]; then
+make_stunnel_self_signed() {
     warn "Generating self-signed certificate..."
     command -v openssl >/dev/null 2>&1 || {
         systemctl start ws-proxy >/dev/null 2>&1 || true
@@ -657,15 +658,27 @@ if [ -z "$DOMAIN" ] || [ ! -f "$STUNNEL_CERT" ]; then
     }
     timeout 30 openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=US/ST=NA/L=NA/O=VPN/CN=vpn-server" \
-        -out "$STUNNEL_CERT" -keyout /etc/stunnel/stunnel.key >/dev/null 2>&1 || {
+        -out "$STUNNEL_CERT" -keyout "$STUNNEL_KEY" >/dev/null 2>&1 || {
             systemctl start ws-proxy >/dev/null 2>&1 || true
             error "Could not generate the fallback SSL certificate"
         }
-    cat /etc/stunnel/stunnel.key >> "$STUNNEL_CERT"
-    rm -f /etc/stunnel/stunnel.key
     success "Self-signed certificate created"
+}
+
+stunnel_credentials_valid() {
+    [ -s "$STUNNEL_CERT" ] && [ -s "$STUNNEL_KEY" ] \
+        && openssl x509 -in "$STUNNEL_CERT" -noout >/dev/null 2>&1 \
+        && openssl pkey -in "$STUNNEL_KEY" -noout >/dev/null 2>&1 \
+        && [ "$(openssl x509 -in "$STUNNEL_CERT" -pubkey -noout 2>/dev/null \
+                 | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" \
+             = "$(openssl pkey -in "$STUNNEL_KEY" -pubout -outform DER 2>/dev/null \
+                 | sha256sum | awk '{print $1}')" ]
+}
+
+if [ -z "$DOMAIN" ] || ! stunnel_credentials_valid; then
+    make_stunnel_self_signed
 fi
-chmod 600 "$STUNNEL_CERT" 2>/dev/null \
+chmod 600 "$STUNNEL_CERT" "$STUNNEL_KEY" 2>/dev/null \
     || warn "Could not restrict certificate permissions — continuing"
 
 # Port 80 is free again — start the proxy.
@@ -701,6 +714,7 @@ fi
 cat > /etc/stunnel/stunnel.conf <<EOF
 pid     = /var/run/stunnel4.pid
 cert    = ${STUNNEL_CERT}
+key     = ${STUNNEL_KEY}
 client  = no
 socket  = a:SO_REUSEADDR=1
 socket  = l:TCP_NODELAY=1
@@ -718,8 +732,31 @@ accept  = 447
 connect = 127.0.0.1:22
 EOF
 
+if [ -f /etc/default/stunnel4 ]; then
+    if grep -q '^ENABLED=' /etc/default/stunnel4; then
+        sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
+    else
+        echo 'ENABLED=1' >> /etc/default/stunnel4
+    fi
+fi
+rm -f /var/run/stunnel4.pid /run/stunnel4.pid 2>/dev/null || true
 systemctl enable stunnel4 >/dev/null 2>&1 || true
-if systemctl restart stunnel4 >/dev/null 2>&1; then
+
+STUNNEL_STARTED=0
+systemctl restart stunnel4 >/dev/null 2>&1 && STUNNEL_STARTED=1
+
+# A stale or malformed PEM from an older installation is a common cause.
+# When both SSL ports are free, replace it once and retry automatically.
+if [ "$STUNNEL_STARTED" -eq 0 ] \
+   && ! ss -ltn 2>/dev/null | grep -qE ':(443|447)[[:space:]]'; then
+    warn "Stunnel start failed — repairing its certificate and retrying once"
+    make_stunnel_self_signed
+    chmod 600 "$STUNNEL_CERT" "$STUNNEL_KEY" 2>/dev/null || true
+    rm -f /var/run/stunnel4.pid /run/stunnel4.pid 2>/dev/null || true
+    systemctl restart stunnel4 >/dev/null 2>&1 && STUNNEL_STARTED=1
+fi
+
+if [ "$STUNNEL_STARTED" -eq 1 ]; then
     sleep 1
     if systemctl is-active --quiet stunnel4 2>/dev/null; then
         success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
@@ -729,11 +766,13 @@ if systemctl restart stunnel4 >/dev/null 2>&1; then
     fi
 else
     warn "Stunnel could not start — installation will continue"
-    if ss -ltnp 2>/dev/null | grep -qE '(:443[[:space:]])'; then
-        warn "TCP 443 is already occupied; check: ss -ltnp | grep ':443'"
-    else
-        warn "Check later with: journalctl -u stunnel4 -n 30"
-    fi
+    ss -ltnp 2>/dev/null | grep -E ':(443|447)[[:space:]]' \
+        | while IFS= read -r line; do warn "SSL port occupied: $line"; done
+    STUNNEL_REASON=$(journalctl -u stunnel4 -n 8 --no-pager 2>/dev/null \
+        | grep -Ei 'error|failed|cannot|address already|permission|pem|key|certificate' \
+        | tail -n 1 || true)
+    [ -n "$STUNNEL_REASON" ] && warn "Stunnel error: $STUNNEL_REASON"
+    warn "Check details with: journalctl -u stunnel4 -n 30"
 fi
 
 # ═══════════════════════════════════════════
@@ -2583,6 +2622,7 @@ TR_WS_TLS=2083; TR_WS_NONE=8080; TR_HTTP_NONE=2082; TR_HTTP_TLS=2087; TR_SPLIT_T
 XP443F=/etc/xray/port443
 STCONF=/etc/stunnel/stunnel.conf
 STCERT=/etc/stunnel/stunnel.pem
+STKEY=/etc/stunnel/stunnel.key
 
 xray_paths() {
     mkdir -p /etc/xray /usr/local/etc/xray
@@ -2615,6 +2655,7 @@ write_stunnel_conf() {
     {
         echo "pid     = /var/run/stunnel4.pid"
         echo "cert    = ${STCERT}"
+        echo "key     = ${STKEY}"
         echo "client  = no"
         echo "socket  = a:SO_REUSEADDR=1"
         echo "socket  = l:TCP_NODELAY=1"
