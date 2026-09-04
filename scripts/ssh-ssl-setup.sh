@@ -90,7 +90,6 @@ phase() {  # phase "Title"
 CONF_DIR=/etc/ssh-panel
 mkdir -p "$CONF_DIR"
 STUNNEL_CERT=/etc/stunnel/stunnel.pem
-STUNNEL_KEY=/etc/stunnel/stunnel.key
 
 # ═══════════════════════════════════════════
 # ASK FOR DOMAIN
@@ -183,30 +182,23 @@ APT="apt-get install -y \
     -o Dpkg::Options::='--force-confold'"
 
 phase "System packages"
-timeout 180 apt-get update -y </dev/null >/dev/null 2>&1 \
-    || warn "Package index update timed out/failed — continuing with cached packages"
+apt-get update -y </dev/null >/dev/null 2>&1
 
 # ═══════════════════════════════════════════
 # SECTION 1 — OPENSSH
 # ═══════════════════════════════════════════
 phase "OpenSSH server"
-timeout 180 apt-get install -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    openssh-server curl </dev/null >/dev/null 2>&1 \
-    || warn "OpenSSH package step failed — existing installation will be configured"
+eval "$APT openssh-server curl" </dev/null >/dev/null 2>&1
 
 SSHD_CONF=/etc/ssh/sshd_config
-if [ -f "$SSHD_CONF" ] && [ ! -f "${SSHD_CONF}.orig" ]; then
-    cp "$SSHD_CONF" "${SSHD_CONF}.orig" 2>/dev/null || true
-fi
+[ ! -f "${SSHD_CONF}.orig" ] && cp "$SSHD_CONF" "${SSHD_CONF}.orig"
 
 apply_sshd_setting() {
     local key="$1" val="$2"
     if grep -qE "^#?${key}" "$SSHD_CONF"; then
-        sed -i "s|^#\?${key}.*|${key} ${val}|g" "$SSHD_CONF" 2>/dev/null || true
+        sed -i "s|^#\?${key}.*|${key} ${val}|g" "$SSHD_CONF"
     else
-        echo "${key} ${val}" >> "$SSHD_CONF" 2>/dev/null || true
+        echo "${key} ${val}" >> "$SSHD_CONF"
     fi
 }
 
@@ -228,21 +220,17 @@ success "OpenSSH configured on port 22"
 # SECTION 2 — DROPBEAR (direct SSH targets)
 # ═══════════════════════════════════════════
 phase "Dropbear SSH"
-timeout 180 apt-get install -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    dropbear </dev/null >/dev/null 2>&1 \
-    || warn "Dropbear package step failed — installation will continue"
+eval "$APT dropbear" </dev/null >/dev/null 2>&1
 
-mkdir -p /etc/dropbear 2>/dev/null || warn "Could not create Dropbear config directory"
+mkdir -p /etc/dropbear
 for TYPE in dss rsa ecdsa ed25519; do
     KEYFILE="/etc/dropbear/dropbear_${TYPE}_host_key"
     [ -f "$KEYFILE" ] || dropbearkey -t "$TYPE" -f "$KEYFILE" >/dev/null 2>&1 || true
 done
 
 # Dropbear (and OpenSSH) accept tunnel-only accounts whose shell is /bin/false.
-grep -qxF '/bin/false' /etc/shells || echo '/bin/false' >> /etc/shells 2>/dev/null || true
-grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells 2>/dev/null || true
+grep -qxF '/bin/false' /etc/shells || echo '/bin/false' >> /etc/shells
+grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells
 
 cat > /etc/default/dropbear <<'EOF'
 NO_START=0
@@ -253,11 +241,8 @@ DROPBEAR_RECEIVE_WINDOW=65536
 EOF
 
 systemctl enable dropbear >/dev/null 2>&1 || true
-if timeout 30 systemctl restart dropbear >/dev/null 2>&1; then
-    success "Dropbear running on ports 109 and 143"
-else
-    warn "Dropbear did not start — installation will continue"
-fi
+systemctl restart dropbear
+success "Dropbear running on ports 109 and 143"
 
 # ═══════════════════════════════════════════
 # SECTION 3 — DUAL-MODE WEBSOCKET/SSH PROXY (port 80)
@@ -268,8 +253,7 @@ phase "WebSocket proxy"
 rm -f /usr/local/bin/ws-proxy.py 2>/dev/null || true
 
 BUILD_DIR=/tmp/ws-proxy-build
-rm -rf "$BUILD_DIR" 2>/dev/null || true
-mkdir -p "$BUILD_DIR" 2>/dev/null || warn "Could not create WebSocket build directory"
+rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
 
 cat > "$BUILD_DIR/main.go" <<'GOEOF'
 // Dual-mode WebSocket/SSH proxy (compiled).
@@ -371,13 +355,6 @@ func handle(client net.Conn) {
 		return
 	}
 
-	// Start backend -> client now so the OpenSSH banner reaches clients that
-	// correctly wait for the server identification before sending theirs.
-	payloadDone := make(chan struct{}, 2)
-	go func() {
-		pipe(client, backend, payloadDone)
-	}()
-
 	// A payload may send SEVERAL HTTP blocks (e.g. a second CONNECT line, or a
 	// body it only sends after the 100/101 reply) before the real SSH stream.
 	// Forwarding that junk to SSH corrupts the handshake, so strip everything up
@@ -401,17 +378,7 @@ func handle(client net.Conn) {
 	if idx >= 0 {
 		prefix = buf[idx:] // forward from the SSH banner onward
 	}
-	if len(prefix) > 0 {
-		if _, err := backend.Write(prefix); err != nil {
-			client.Close()
-			backend.Close()
-			return
-		}
-	}
-	pipe(backend, client, payloadDone)
-	<-payloadDone
-	client.Close()
-	backend.Close()
+	bridge(client, backend, prefix)
 }
 
 func main() {
@@ -528,11 +495,6 @@ def handle(c):
         except Exception: pass
     try: c.sendall(RESP)
     except Exception: c.close(); b.close(); return
-    # Let the SSH server banner reach the client immediately. Waiting for the
-    # client's SSH identification first deadlocks clients that wait for the
-    # server banner, as required by normal SSH negotiation.
-    down=threading.Thread(target=pipe,args=(b,c),daemon=True)
-    down.start()
     # A payload may send more HTTP blocks (a second CONNECT line, or a body sent
     # only after the 100/101 reply) before the real SSH stream. Forwarding that
     # junk corrupts the SSH handshake, so strip everything up to the "SSH-"
@@ -550,10 +512,7 @@ def handle(c):
         try: c.settimeout(None)
         except Exception: pass
     pre=buf[idx:] if idx>=0 else b""
-    try:
-        if pre: b.sendall(pre)
-        pipe(c,b)
-        down.join()
+    try: bridge(c,b,pre)
     finally: c.close(); b.close()
 def main():
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
@@ -566,7 +525,7 @@ def main():
         except Exception: pass
 main()
 PYEOF
-    chmod +x /usr/local/bin/ws-proxy.py 2>/dev/null || true
+    chmod +x /usr/local/bin/ws-proxy.py
     PROXY_EXEC="/usr/bin/python3 /usr/local/bin/ws-proxy.py"
 fi
 
@@ -589,10 +548,8 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-timeout 30 systemctl daemon-reload >/dev/null 2>&1 \
-    || warn "Could not reload systemd for WebSocket proxy"
-timeout 30 systemctl enable ws-proxy >/dev/null 2>&1 \
-    || warn "Could not enable WebSocket proxy at boot"
+systemctl daemon-reload
+systemctl enable ws-proxy >/dev/null 2>&1
 # (started after the certificate step, which needs port 80 for certbot)
 success "WebSocket/SSH proxy installed (port 80)"
 
@@ -600,13 +557,7 @@ success "WebSocket/SSH proxy installed (port 80)"
 # SECTION 4 — SSL CERTIFICATE
 # ═══════════════════════════════════════════
 phase "SSL certificate"
-# Package mirrors can occasionally stall forever. Cap this phase; openssl is
-# normally already present, and the explicit checks below fail clearly rather
-# than leaving the installer frozen on "SSL certificate".
-timeout 180 apt-get install -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    stunnel4 openssl </dev/null >/dev/null 2>&1 || true
+eval "$APT stunnel4 openssl" </dev/null >/dev/null 2>&1
 mkdir -p /etc/stunnel
 
 # Make sure nothing is holding port 80 while certbot validates.
@@ -615,34 +566,16 @@ systemctl stop nginx 2>/dev/null || true
 systemctl stop apache2 2>/dev/null || true
 
 if [ -n "$DOMAIN" ]; then
-    # Re-runs should reuse a valid certificate instead of contacting ACME
-    # again. A bad DNS record/firewall must never hold the whole install.
-    if [ -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] \
-       && [ -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]; then
-        LE_OK=1
-        info "Using existing Let's Encrypt certificate for $DOMAIN"
-    else
-        info "Requesting Let's Encrypt certificate for $DOMAIN (max 90s) ..."
-        timeout 180 apt-get install -y \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
-            certbot </dev/null >/dev/null 2>&1 || true
-        if command -v certbot >/dev/null 2>&1; then
-            timeout --signal=TERM --kill-after=10s 90s \
-                certbot certonly --standalone -d "$DOMAIN" \
-                --non-interactive --agree-tos \
-                --register-unsafely-without-email \
-                --preferred-challenges http >/dev/null 2>&1 \
-                && LE_OK=1 || LE_OK=0
-        else
-            LE_OK=0
-        fi
-    fi
+    info "Requesting Let's Encrypt certificate for $DOMAIN ..."
+    eval "$APT certbot" </dev/null >/dev/null 2>&1 || true
+    certbot certonly --standalone -d "$DOMAIN" \
+        --non-interactive --agree-tos \
+        --register-unsafely-without-email >/dev/null 2>&1 && LE_OK=1 || LE_OK=0
 
     if [ "${LE_OK:-0}" -eq 1 ] && [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
         chmod -R 755 /etc/letsencrypt/archive /etc/letsencrypt/live
-        cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" > "$STUNNEL_CERT"
-        cat "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$STUNNEL_KEY"
+        cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" \
+            "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$STUNNEL_CERT"
         success "Let's Encrypt certificate obtained for $DOMAIN"
     else
         warn "Let's Encrypt failed — using self-signed certificate"
@@ -650,36 +583,16 @@ if [ -n "$DOMAIN" ]; then
     fi
 fi
 
-make_stunnel_self_signed() {
+if [ -z "$DOMAIN" ] || [ ! -f "$STUNNEL_CERT" ]; then
     warn "Generating self-signed certificate..."
-    command -v openssl >/dev/null 2>&1 || {
-        systemctl start ws-proxy >/dev/null 2>&1 || true
-        error "OpenSSL is unavailable; package installation failed"
-    }
-    timeout 30 openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+    openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=US/ST=NA/L=NA/O=VPN/CN=vpn-server" \
-        -out "$STUNNEL_CERT" -keyout "$STUNNEL_KEY" >/dev/null 2>&1 || {
-            systemctl start ws-proxy >/dev/null 2>&1 || true
-            error "Could not generate the fallback SSL certificate"
-        }
+        -out "$STUNNEL_CERT" -keyout /etc/stunnel/stunnel.key >/dev/null 2>&1
+    cat /etc/stunnel/stunnel.key >> "$STUNNEL_CERT"
+    rm -f /etc/stunnel/stunnel.key
     success "Self-signed certificate created"
-}
-
-stunnel_credentials_valid() {
-    [ -s "$STUNNEL_CERT" ] && [ -s "$STUNNEL_KEY" ] \
-        && openssl x509 -in "$STUNNEL_CERT" -noout >/dev/null 2>&1 \
-        && openssl pkey -in "$STUNNEL_KEY" -noout >/dev/null 2>&1 \
-        && [ "$(openssl x509 -in "$STUNNEL_CERT" -pubkey -noout 2>/dev/null \
-                 | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" \
-             = "$(openssl pkey -in "$STUNNEL_KEY" -pubout -outform DER 2>/dev/null \
-                 | sha256sum | awk '{print $1}')" ]
-}
-
-if [ -z "$DOMAIN" ] || ! stunnel_credentials_valid; then
-    make_stunnel_self_signed
 fi
-chmod 600 "$STUNNEL_CERT" "$STUNNEL_KEY" 2>/dev/null \
-    || warn "Could not restrict certificate permissions — continuing"
+chmod 600 "$STUNNEL_CERT"
 
 # Port 80 is free again — start the proxy.
 systemctl start ws-proxy >/dev/null 2>&1 || true
@@ -692,29 +605,9 @@ systemctl start ws-proxy >/dev/null 2>&1 || true
 phase "Stunnel TLS"
 sed -i 's/ENABLED=0/ENABLED=1/g' /etc/default/stunnel4 2>/dev/null || true
 
-# Re-runs may find Xray still owning TCP 443 from a previous menu selection.
-# The installer's default 443 owner is SSL-payload/stunnel, so hand the port
-# back only when Xray is the confirmed listener. Never kill unknown processes.
-if ss -ltnp 2>/dev/null | grep -E '(:443[[:space:]])' | grep -qi 'xray'; then
-    systemctl stop xray >/dev/null 2>&1 || true
-    sleep 1
-fi
-
-# If the bounded package step above hit a temporary apt lock/mirror timeout,
-# make one final bounded attempt here. Failure is reported but must not abort
-# the remaining installation phases.
-if ! command -v stunnel4 >/dev/null 2>&1 \
-   && ! command -v stunnel >/dev/null 2>&1; then
-    timeout 120 apt-get install -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        stunnel4 </dev/null >/dev/null 2>&1 || true
-fi
-
 cat > /etc/stunnel/stunnel.conf <<EOF
 pid     = /var/run/stunnel4.pid
 cert    = ${STUNNEL_CERT}
-key     = ${STUNNEL_KEY}
 client  = no
 socket  = a:SO_REUSEADDR=1
 socket  = l:TCP_NODELAY=1
@@ -732,48 +625,9 @@ accept  = 447
 connect = 127.0.0.1:22
 EOF
 
-if [ -f /etc/default/stunnel4 ]; then
-    if grep -q '^ENABLED=' /etc/default/stunnel4; then
-        sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
-    else
-        echo 'ENABLED=1' >> /etc/default/stunnel4
-    fi
-fi
-rm -f /var/run/stunnel4.pid /run/stunnel4.pid 2>/dev/null || true
 systemctl enable stunnel4 >/dev/null 2>&1 || true
-
-STUNNEL_STARTED=0
-systemctl restart stunnel4 >/dev/null 2>&1 && STUNNEL_STARTED=1
-
-# A stale or malformed PEM from an older installation is a common cause.
-# When both SSL ports are free, replace it once and retry automatically.
-if [ "$STUNNEL_STARTED" -eq 0 ] \
-   && ! ss -ltn 2>/dev/null | grep -qE ':(443|447)[[:space:]]'; then
-    warn "Stunnel start failed — repairing its certificate and retrying once"
-    make_stunnel_self_signed
-    chmod 600 "$STUNNEL_CERT" "$STUNNEL_KEY" 2>/dev/null || true
-    rm -f /var/run/stunnel4.pid /run/stunnel4.pid 2>/dev/null || true
-    systemctl restart stunnel4 >/dev/null 2>&1 && STUNNEL_STARTED=1
-fi
-
-if [ "$STUNNEL_STARTED" -eq 1 ]; then
-    sleep 1
-    if systemctl is-active --quiet stunnel4 2>/dev/null; then
-        success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
-    else
-        warn "Stunnel did not stay active — installation will continue"
-        warn "Check later with: journalctl -u stunnel4 -n 30"
-    fi
-else
-    warn "Stunnel could not start — installation will continue"
-    ss -ltnp 2>/dev/null | grep -E ':(443|447)[[:space:]]' \
-        | while IFS= read -r line; do warn "SSL port occupied: $line"; done
-    STUNNEL_REASON=$(journalctl -u stunnel4 -n 8 --no-pager 2>/dev/null \
-        | grep -Ei 'error|failed|cannot|address already|permission|pem|key|certificate' \
-        | tail -n 1 || true)
-    [ -n "$STUNNEL_REASON" ] && warn "Stunnel error: $STUNNEL_REASON"
-    warn "Check details with: journalctl -u stunnel4 -n 30"
-fi
+systemctl restart stunnel4 >/dev/null 2>&1
+success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
 
 # ═══════════════════════════════════════════
 # SECTION 6 — FIREWALL
@@ -781,9 +635,9 @@ fi
 phase "Firewall rules"
 if command -v ufw >/dev/null 2>&1; then
     for P in 22 80 109 143 443 447; do
-        timeout 20 ufw allow ${P}/tcp >/dev/null 2>&1 || true
+        ufw allow ${P}/tcp >/dev/null 2>&1
     done
-    timeout 20 ufw allow 53/udp >/dev/null 2>&1 || true   # SlowDNS
+    ufw allow 53/udp >/dev/null 2>&1   # SlowDNS (dnstt) tunnel
     success "UFW rules applied"
 else
     warn "ufw not found — open TCP ports manually: 22 80 109 143 443 447 + 53/udp"
@@ -1847,8 +1701,7 @@ case "$1" in
     *) echo "usage: abuse-guard {enable|disable|refresh|status|test}";;
 esac
 AGEOF
-chmod +x /usr/local/bin/abuse-guard 2>/dev/null \
-    || warn "Could not mark abuse protection helper executable"
+chmod +x /usr/local/bin/abuse-guard
 
 cat > /etc/systemd/system/abuse-guard.service <<'EOF'
 [Unit]
@@ -1864,8 +1717,7 @@ ExecStart=/usr/local/bin/abuse-guard apply-fw
 [Install]
 WantedBy=multi-user.target
 EOF
-timeout 30 systemctl daemon-reload >/dev/null 2>&1 \
-    || warn "Could not register abuse protection service"
+systemctl daemon-reload >/dev/null 2>&1
 success "Abuse protection installed (enable it from the menu)"
 
 # ═══════════════════════════════════════════
@@ -1877,7 +1729,7 @@ eval "$APT vnstat" </dev/null >/dev/null 2>&1 || true
 PRIMARY_IFACE=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
 [ -z "$PRIMARY_IFACE" ] && PRIMARY_IFACE=$(ls /sys/class/net 2>/dev/null | grep -v lo | head -n1)
 if [ -n "$PRIMARY_IFACE" ]; then
-    echo "$PRIMARY_IFACE" > "$CONF_DIR/iface.conf" 2>/dev/null || true
+    echo "$PRIMARY_IFACE" > "$CONF_DIR/iface.conf"
     vnstat --add -i "$PRIMARY_IFACE" >/dev/null 2>&1 || true
 fi
 systemctl enable vnstat >/dev/null 2>&1 || true
@@ -2187,8 +2039,7 @@ cat > "$XCONF" <<JSON
 JSON
 if systemctl is-enabled xray >/dev/null 2>&1; then systemctl restart xray >/dev/null 2>&1; fi
 XGEOF
-chmod +x /usr/local/bin/xray-gen 2>/dev/null \
-    || warn "Could not mark Xray generator executable"
+chmod +x /usr/local/bin/xray-gen
 
 # --- limit checker: drops expired / over-quota accounts, then regenerates --
 cat > /usr/local/bin/xray-check <<'XCEOF'
@@ -2221,14 +2072,13 @@ while IFS= read -r line; do
 done < "$XACC"
 if [ "$changed" -eq 1 ]; then mv "$tmp" "$XACC"; /usr/local/bin/xray-gen; else rm -f "$tmp"; fi
 XCEOF
-chmod +x /usr/local/bin/xray-check 2>/dev/null \
-    || warn "Could not mark Xray quota checker executable"
+chmod +x /usr/local/bin/xray-check
 
 # --- cron: run the checker every 10 minutes ------------------------------
 cat > /etc/cron.d/xray-check <<'EOF'
 */10 * * * * root /usr/local/bin/xray-check >/dev/null 2>&1
 EOF
-chmod 644 /etc/cron.d/xray-check 2>/dev/null || true
+chmod 644 /etc/cron.d/xray-check
 command -v cron >/dev/null 2>&1 || eval "$APT cron" </dev/null >/dev/null 2>&1 || true
 systemctl enable cron >/dev/null 2>&1 || true
 systemctl restart cron >/dev/null 2>&1 || true
@@ -2622,7 +2472,6 @@ TR_WS_TLS=2083; TR_WS_NONE=8080; TR_HTTP_NONE=2082; TR_HTTP_TLS=2087; TR_SPLIT_T
 XP443F=/etc/xray/port443
 STCONF=/etc/stunnel/stunnel.conf
 STCERT=/etc/stunnel/stunnel.pem
-STKEY=/etc/stunnel/stunnel.key
 
 xray_paths() {
     mkdir -p /etc/xray /usr/local/etc/xray
@@ -2655,7 +2504,6 @@ write_stunnel_conf() {
     {
         echo "pid     = /var/run/stunnel4.pid"
         echo "cert    = ${STCERT}"
-        echo "key     = ${STKEY}"
         echo "client  = no"
         echo "socket  = a:SO_REUSEADDR=1"
         echo "socket  = l:TCP_NODELAY=1"
@@ -3505,8 +3353,7 @@ while true; do
 done
 MENUEOF
 
-chmod +x /usr/local/bin/menu 2>/dev/null \
-    || warn "Could not mark management menu executable"
+chmod +x /usr/local/bin/menu
 success "Management panel installed — type 'menu' to open it"
 
 # ═══════════════════════════════════════════
@@ -3559,8 +3406,7 @@ echo -e "  ${TEAL}╰───────────────────�
 echo -e "        ${GRY}type${NC} ${W}${BOLD}menu${NC} ${GRY}to open the control panel${NC}"
 echo ""
 MOTDEOF
-chmod +x /etc/update-motd.d/00-litronx 2>/dev/null \
-    || warn "Could not enable login watermark"
+chmod +x /etc/update-motd.d/00-litronx
 # OpenSSH on Debian renders update-motd.d through pam_motd; make sure the
 # static-motd printer is also enabled so pam runs the dynamic scripts.
 grep -q 'pam_motd.so motd=/run/motd.dynamic' /etc/pam.d/sshd 2>/dev/null || true
@@ -3574,53 +3420,16 @@ success "Login watermark installed — shows on every server login"
 phase "Default users"
 DEFAULT_USER_PASS="0000"
 DEFAULT_USER_DAYS=30
-DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d" 2>/dev/null)
-[ -n "$DEFAULT_USER_EXP" ] || DEFAULT_USER_EXP="never"
+DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d")
 for U in deon febo geto weon ceon; do
     if id "$U" >/dev/null 2>&1; then
         info "User '$U' already exists — skipped"
     else
-        if [ "$DEFAULT_USER_EXP" = "never" ]; then
-            CREATE_USER_CMD=(useradd -M -s /bin/false "$U")
-        else
-            CREATE_USER_CMD=(useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U")
-        fi
-        if "${CREATE_USER_CMD[@]}" >/dev/null 2>&1 \
-           && id "$U" >/dev/null 2>&1 \
-           && echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1; then
-            success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
-        else
-            warn "Could not create default user '$U' — continuing"
-        fi
+        useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U"
+        echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
+        success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
     fi
 done
-
-# Final health pass: retry only services that are not active. Already-working
-# protocols are never restarted or disturbed. SlowDNS is checked only when the
-# user supplied an NS domain; Xray intentionally remains off until activated
-# from its menu.
-FINAL_SERVICE_WARNINGS=""
-ensure_active() {
-    local unit="$1" label="$2"
-    systemctl is-active --quiet "$unit" 2>/dev/null && return 0
-    timeout 30 systemctl restart "$unit" >/dev/null 2>&1 || true
-    if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
-        FINAL_SERVICE_WARNINGS="${FINAL_SERVICE_WARNINGS}${FINAL_SERVICE_WARNINGS:+, }${label}"
-        return 1
-    fi
-}
-
-if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
-    ensure_active ssh "OpenSSH" || true
-else
-    ensure_active sshd "OpenSSH" || true
-fi
-ensure_active dropbear "Dropbear" || true
-ensure_active ws-proxy "WebSocket" || true
-ensure_active stunnel4 "SSL/Stunnel" || true
-if [ -n "$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)" ]; then
-    ensure_active slowdns "SlowDNS" || true
-fi
 
 # ═══════════════════════════════════════════
 # FINAL MESSAGE
@@ -3629,11 +3438,7 @@ UI_SILENT=0
 _ELAPSED=$(( SECONDS - INSTALL_T0 ))
 clear
 echo ""
-echo -e "  ${LIME}${BOLD}  ✔  INSTALLATION COMPLETE${NC}   ${GRY}all setup phases completed in ${BWHITE}${_ELAPSED}s${GRY}.${NC}"
-if [ -n "$FINAL_SERVICE_WARNINGS" ]; then
-    echo -e "  ${BYellow}${BOLD}  ⚠  Needs attention:${NC} ${BWHITE}${FINAL_SERVICE_WARNINGS}${NC}"
-    echo -e "  ${GRY}Run ${BWHITE}systemctl status <service>${GRY} or open ${BWHITE}menu → Service status${GRY}.${NC}"
-fi
+echo -e "  ${LIME}${BOLD}  ✔  INSTALLATION COMPLETE${NC}   ${GRY}all protocols installed in ${BWHITE}${_ELAPSED}s${GRY}.${NC}"
 echo ""
 echo -e "  ${TEAL}╭──────────────────────────────────────────────────────╮${NC}"
 printf  "  ${TEAL}│${NC}  ${SKY}◆${NC} %-13s ${BWHITE}${BOLD}%-33.33s${NC}${TEAL}│${NC}\n" "Host / Domain" "${DOMAIN:-$SERVER_IP}"
