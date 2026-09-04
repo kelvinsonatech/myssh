@@ -557,7 +557,13 @@ success "WebSocket/SSH proxy installed (port 80)"
 # SECTION 4 — SSL CERTIFICATE
 # ═══════════════════════════════════════════
 phase "SSL certificate"
-eval "$APT stunnel4 openssl" </dev/null >/dev/null 2>&1
+# Package mirrors can occasionally stall forever. Cap this phase; openssl is
+# normally already present, and the explicit checks below fail clearly rather
+# than leaving the installer frozen on "SSL certificate".
+timeout 180 apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    stunnel4 openssl </dev/null >/dev/null 2>&1 || true
 mkdir -p /etc/stunnel
 
 # Make sure nothing is holding port 80 while certbot validates.
@@ -566,11 +572,29 @@ systemctl stop nginx 2>/dev/null || true
 systemctl stop apache2 2>/dev/null || true
 
 if [ -n "$DOMAIN" ]; then
-    info "Requesting Let's Encrypt certificate for $DOMAIN ..."
-    eval "$APT certbot" </dev/null >/dev/null 2>&1 || true
-    certbot certonly --standalone -d "$DOMAIN" \
-        --non-interactive --agree-tos \
-        --register-unsafely-without-email >/dev/null 2>&1 && LE_OK=1 || LE_OK=0
+    # Re-runs should reuse a valid certificate instead of contacting ACME
+    # again. A bad DNS record/firewall must never hold the whole install.
+    if [ -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] \
+       && [ -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]; then
+        LE_OK=1
+        info "Using existing Let's Encrypt certificate for $DOMAIN"
+    else
+        info "Requesting Let's Encrypt certificate for $DOMAIN (max 90s) ..."
+        timeout 180 apt-get install -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            certbot </dev/null >/dev/null 2>&1 || true
+        if command -v certbot >/dev/null 2>&1; then
+            timeout --signal=TERM --kill-after=10s 90s \
+                certbot certonly --standalone -d "$DOMAIN" \
+                --non-interactive --agree-tos \
+                --register-unsafely-without-email \
+                --preferred-challenges http >/dev/null 2>&1 \
+                && LE_OK=1 || LE_OK=0
+        else
+            LE_OK=0
+        fi
+    fi
 
     if [ "${LE_OK:-0}" -eq 1 ] && [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
         chmod -R 755 /etc/letsencrypt/archive /etc/letsencrypt/live
@@ -585,9 +609,16 @@ fi
 
 if [ -z "$DOMAIN" ] || [ ! -f "$STUNNEL_CERT" ]; then
     warn "Generating self-signed certificate..."
-    openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+    command -v openssl >/dev/null 2>&1 || {
+        systemctl start ws-proxy >/dev/null 2>&1 || true
+        error "OpenSSL is unavailable; package installation failed"
+    }
+    timeout 30 openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=US/ST=NA/L=NA/O=VPN/CN=vpn-server" \
-        -out "$STUNNEL_CERT" -keyout /etc/stunnel/stunnel.key >/dev/null 2>&1
+        -out "$STUNNEL_CERT" -keyout /etc/stunnel/stunnel.key >/dev/null 2>&1 || {
+            systemctl start ws-proxy >/dev/null 2>&1 || true
+            error "Could not generate the fallback SSL certificate"
+        }
     cat /etc/stunnel/stunnel.key >> "$STUNNEL_CERT"
     rm -f /etc/stunnel/stunnel.key
     success "Self-signed certificate created"
