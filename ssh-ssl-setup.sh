@@ -3308,30 +3308,43 @@ hysteria_menu() {
 }
 
 menu_item() {  # menu_item NUM ICON "Label" color
-    echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
+    printf "  %b%2s%b ${GR}│${NC} %b%-3s%b %b%s%b\n" \
+        "$4" "$1" "$NC" "$4" "$2" "$NC" "$W" "$3" "$NC"
+}
+
+menu_group() {
+    echo -e "  ${GR}── ${DIM}$1${NC}"
 }
 
 while true; do
     banner
     status_bar
     echo ""
-    menu_item "1" "➕" "Create SSH user"          "$LIME"
-    menu_item "2" "🗑 " "Delete SSH user"          "$R"
-    menu_item "3" "📋" "List all users"           "$SKY"
-    menu_item "4" "🟢" "Show online users"        "$G"
-    menu_item "5" "🔑" "Change user password"     "$ORANGE"
-    menu_item "6" "♻️ " "Renew / extend account"   "$VIOLET"
-    menu_item "7" "📊" "Service status"           "$C"
-    menu_item "8" "📶" "Bandwidth usage"          "$SKY"
-    menu_item "9" "🌐" "Xray / V2Ray (VMess)"     "$PINK"
-    menu_item "10" "🔄" "Restart all services"    "$Y"
-    menu_item "11" "🐌" "SlowDNS info"            "$PINK"
-    menu_item "12" "🛡 " "Abuse protection"        "$LIME"
-    menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
-    menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
-    menu_item "0" "🚪" "Exit"                     "$GR"
+    menu_group "ACCOUNT ACCESS"
+    menu_item "1" "+" "Create SSH user"             "$LIME"
+    menu_item "2" "x" "Delete SSH user"             "$R"
+    menu_item "3" "#" "List all users"              "$SKY"
+    menu_item "4" "o" "Show online users"           "$G"
+    menu_item "5" "*" "Change user password"        "$ORANGE"
+    menu_item "6" "+" "Renew / extend account"      "$VIOLET"
     echo ""
-    read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
+    menu_group "SERVICE MONITORING"
+    menu_item "7" "@" "Service status"              "$C"
+    menu_item "8" "~" "Bandwidth usage"             "$SKY"
+    menu_item "10" ">" "Restart all services"       "$Y"
+    echo ""
+    menu_group "TUNNELS & SECURITY"
+    menu_item "9" "#" "Xray / V2Ray (VMess)"        "$PINK"
+    menu_item "11" "D" "SlowDNS info"               "$PINK"
+    menu_item "12" "+" "Abuse protection"           "$LIME"
+    menu_item "13" ">" "UDP (Hysteria) high-speed"  "$SKY"
+    menu_item "14" "F" "Activate fast DNS"          "$TEAL"
+    echo ""
+    menu_group "SESSION"
+    menu_item "0" "<" "Exit"                        "$GR"
+    echo ""
+    echo -e "  ${GR}myssh · select a number · Ctrl+C to quit${NC}"
+    read -rp "$(echo -e "  ${TEAL}❯${NC} select an option : ")" OPT
     case "$OPT" in
         1) create_user ;;
         2) delete_user ;;
