@@ -636,6 +636,25 @@ systemctl start ws-proxy >/dev/null 2>&1 || true
 phase "Stunnel TLS"
 sed -i 's/ENABLED=0/ENABLED=1/g' /etc/default/stunnel4 2>/dev/null || true
 
+# Re-runs may find Xray still owning TCP 443 from a previous menu selection.
+# The installer's default 443 owner is SSL-payload/stunnel, so hand the port
+# back only when Xray is the confirmed listener. Never kill unknown processes.
+if ss -ltnp 2>/dev/null | grep -E '(:443[[:space:]])' | grep -qi 'xray'; then
+    systemctl stop xray >/dev/null 2>&1 || true
+    sleep 1
+fi
+
+# If the bounded package step above hit a temporary apt lock/mirror timeout,
+# make one final bounded attempt here. Failure is reported but must not abort
+# the remaining installation phases.
+if ! command -v stunnel4 >/dev/null 2>&1 \
+   && ! command -v stunnel >/dev/null 2>&1; then
+    timeout 120 apt-get install -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        stunnel4 </dev/null >/dev/null 2>&1 || true
+fi
+
 cat > /etc/stunnel/stunnel.conf <<EOF
 pid     = /var/run/stunnel4.pid
 cert    = ${STUNNEL_CERT}
@@ -657,8 +676,22 @@ connect = 127.0.0.1:22
 EOF
 
 systemctl enable stunnel4 >/dev/null 2>&1 || true
-systemctl restart stunnel4 >/dev/null 2>&1
-success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
+if systemctl restart stunnel4 >/dev/null 2>&1; then
+    sleep 1
+    if systemctl is-active --quiet stunnel4 2>/dev/null; then
+        success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
+    else
+        warn "Stunnel did not stay active — installation will continue"
+        warn "Check later with: journalctl -u stunnel4 -n 30"
+    fi
+else
+    warn "Stunnel could not start — installation will continue"
+    if ss -ltnp 2>/dev/null | grep -qE '(:443[[:space:]])'; then
+        warn "TCP 443 is already occupied; check: ss -ltnp | grep ':443'"
+    else
+        warn "Check later with: journalctl -u stunnel4 -n 30"
+    fi
+fi
 
 # ═══════════════════════════════════════════
 # SECTION 6 — FIREWALL
