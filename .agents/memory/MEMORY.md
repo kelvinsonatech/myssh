@@ -6,3 +6,4 @@
 - [Hysteria UDP tunnel](hysteria-udp.md) — menu 13; user:pass auth, obfs, port-hop UDP 20000-50000→36712; UDP-only so can't break TCP protocols; NOT for zero-data/payload.
 - [SlowDNS UDP 53](slowdns-udp53.md) — dnstt silently fails unless port 53 is freed (disable systemd-resolved stub); verify is-active after start.
 - [SSL certificate phase](ssl-certificate-phase.md) — certificate package/ACME calls must be bounded; reuse valid certs and fall back to self-signed so installation always completes.
+- [Installer phase isolation](installer-phase-isolation.md) — optional package/service failures must warn and continue; finish with a health pass that retries only inactive core services.

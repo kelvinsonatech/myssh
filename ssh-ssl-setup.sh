@@ -182,23 +182,30 @@ APT="apt-get install -y \
     -o Dpkg::Options::='--force-confold'"
 
 phase "System packages"
-apt-get update -y </dev/null >/dev/null 2>&1
+timeout 180 apt-get update -y </dev/null >/dev/null 2>&1 \
+    || warn "Package index update timed out/failed — continuing with cached packages"
 
 # ═══════════════════════════════════════════
 # SECTION 1 — OPENSSH
 # ═══════════════════════════════════════════
 phase "OpenSSH server"
-eval "$APT openssh-server curl" </dev/null >/dev/null 2>&1
+timeout 180 apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    openssh-server curl </dev/null >/dev/null 2>&1 \
+    || warn "OpenSSH package step failed — existing installation will be configured"
 
 SSHD_CONF=/etc/ssh/sshd_config
-[ ! -f "${SSHD_CONF}.orig" ] && cp "$SSHD_CONF" "${SSHD_CONF}.orig"
+if [ -f "$SSHD_CONF" ] && [ ! -f "${SSHD_CONF}.orig" ]; then
+    cp "$SSHD_CONF" "${SSHD_CONF}.orig" 2>/dev/null || true
+fi
 
 apply_sshd_setting() {
     local key="$1" val="$2"
     if grep -qE "^#?${key}" "$SSHD_CONF"; then
-        sed -i "s|^#\?${key}.*|${key} ${val}|g" "$SSHD_CONF"
+        sed -i "s|^#\?${key}.*|${key} ${val}|g" "$SSHD_CONF" 2>/dev/null || true
     else
-        echo "${key} ${val}" >> "$SSHD_CONF"
+        echo "${key} ${val}" >> "$SSHD_CONF" 2>/dev/null || true
     fi
 }
 
@@ -220,17 +227,21 @@ success "OpenSSH configured on port 22"
 # SECTION 2 — DROPBEAR (direct SSH targets)
 # ═══════════════════════════════════════════
 phase "Dropbear SSH"
-eval "$APT dropbear" </dev/null >/dev/null 2>&1
+timeout 180 apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    dropbear </dev/null >/dev/null 2>&1 \
+    || warn "Dropbear package step failed — installation will continue"
 
-mkdir -p /etc/dropbear
+mkdir -p /etc/dropbear 2>/dev/null || warn "Could not create Dropbear config directory"
 for TYPE in dss rsa ecdsa ed25519; do
     KEYFILE="/etc/dropbear/dropbear_${TYPE}_host_key"
     [ -f "$KEYFILE" ] || dropbearkey -t "$TYPE" -f "$KEYFILE" >/dev/null 2>&1 || true
 done
 
 # Dropbear (and OpenSSH) accept tunnel-only accounts whose shell is /bin/false.
-grep -qxF '/bin/false' /etc/shells || echo '/bin/false' >> /etc/shells
-grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells
+grep -qxF '/bin/false' /etc/shells || echo '/bin/false' >> /etc/shells 2>/dev/null || true
+grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells 2>/dev/null || true
 
 cat > /etc/default/dropbear <<'EOF'
 NO_START=0
@@ -241,8 +252,11 @@ DROPBEAR_RECEIVE_WINDOW=65536
 EOF
 
 systemctl enable dropbear >/dev/null 2>&1 || true
-systemctl restart dropbear
-success "Dropbear running on ports 109 and 143"
+if timeout 30 systemctl restart dropbear >/dev/null 2>&1; then
+    success "Dropbear running on ports 109 and 143"
+else
+    warn "Dropbear did not start — installation will continue"
+fi
 
 # ═══════════════════════════════════════════
 # SECTION 3 — DUAL-MODE WEBSOCKET/SSH PROXY (port 80)
@@ -253,7 +267,8 @@ phase "WebSocket proxy"
 rm -f /usr/local/bin/ws-proxy.py 2>/dev/null || true
 
 BUILD_DIR=/tmp/ws-proxy-build
-rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
+rm -rf "$BUILD_DIR" 2>/dev/null || true
+mkdir -p "$BUILD_DIR" 2>/dev/null || warn "Could not create WebSocket build directory"
 
 cat > "$BUILD_DIR/main.go" <<'GOEOF'
 // Dual-mode WebSocket/SSH proxy (compiled).
@@ -525,7 +540,7 @@ def main():
         except Exception: pass
 main()
 PYEOF
-    chmod +x /usr/local/bin/ws-proxy.py
+    chmod +x /usr/local/bin/ws-proxy.py 2>/dev/null || true
     PROXY_EXEC="/usr/bin/python3 /usr/local/bin/ws-proxy.py"
 fi
 
@@ -548,8 +563,10 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable ws-proxy >/dev/null 2>&1
+timeout 30 systemctl daemon-reload >/dev/null 2>&1 \
+    || warn "Could not reload systemd for WebSocket proxy"
+timeout 30 systemctl enable ws-proxy >/dev/null 2>&1 \
+    || warn "Could not enable WebSocket proxy at boot"
 # (started after the certificate step, which needs port 80 for certbot)
 success "WebSocket/SSH proxy installed (port 80)"
 
@@ -623,7 +640,8 @@ if [ -z "$DOMAIN" ] || [ ! -f "$STUNNEL_CERT" ]; then
     rm -f /etc/stunnel/stunnel.key
     success "Self-signed certificate created"
 fi
-chmod 600 "$STUNNEL_CERT"
+chmod 600 "$STUNNEL_CERT" 2>/dev/null \
+    || warn "Could not restrict certificate permissions — continuing"
 
 # Port 80 is free again — start the proxy.
 systemctl start ws-proxy >/dev/null 2>&1 || true
@@ -699,9 +717,9 @@ fi
 phase "Firewall rules"
 if command -v ufw >/dev/null 2>&1; then
     for P in 22 80 109 143 443 447; do
-        ufw allow ${P}/tcp >/dev/null 2>&1
+        timeout 20 ufw allow ${P}/tcp >/dev/null 2>&1 || true
     done
-    ufw allow 53/udp >/dev/null 2>&1   # SlowDNS (dnstt) tunnel
+    timeout 20 ufw allow 53/udp >/dev/null 2>&1 || true   # SlowDNS
     success "UFW rules applied"
 else
     warn "ufw not found — open TCP ports manually: 22 80 109 143 443 447 + 53/udp"
@@ -1765,7 +1783,8 @@ case "$1" in
     *) echo "usage: abuse-guard {enable|disable|refresh|status|test}";;
 esac
 AGEOF
-chmod +x /usr/local/bin/abuse-guard
+chmod +x /usr/local/bin/abuse-guard 2>/dev/null \
+    || warn "Could not mark abuse protection helper executable"
 
 cat > /etc/systemd/system/abuse-guard.service <<'EOF'
 [Unit]
@@ -1781,7 +1800,8 @@ ExecStart=/usr/local/bin/abuse-guard apply-fw
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload >/dev/null 2>&1
+timeout 30 systemctl daemon-reload >/dev/null 2>&1 \
+    || warn "Could not register abuse protection service"
 success "Abuse protection installed (enable it from the menu)"
 
 # ═══════════════════════════════════════════
@@ -1793,7 +1813,7 @@ eval "$APT vnstat" </dev/null >/dev/null 2>&1 || true
 PRIMARY_IFACE=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
 [ -z "$PRIMARY_IFACE" ] && PRIMARY_IFACE=$(ls /sys/class/net 2>/dev/null | grep -v lo | head -n1)
 if [ -n "$PRIMARY_IFACE" ]; then
-    echo "$PRIMARY_IFACE" > "$CONF_DIR/iface.conf"
+    echo "$PRIMARY_IFACE" > "$CONF_DIR/iface.conf" 2>/dev/null || true
     vnstat --add -i "$PRIMARY_IFACE" >/dev/null 2>&1 || true
 fi
 systemctl enable vnstat >/dev/null 2>&1 || true
@@ -2103,7 +2123,8 @@ cat > "$XCONF" <<JSON
 JSON
 if systemctl is-enabled xray >/dev/null 2>&1; then systemctl restart xray >/dev/null 2>&1; fi
 XGEOF
-chmod +x /usr/local/bin/xray-gen
+chmod +x /usr/local/bin/xray-gen 2>/dev/null \
+    || warn "Could not mark Xray generator executable"
 
 # --- limit checker: drops expired / over-quota accounts, then regenerates --
 cat > /usr/local/bin/xray-check <<'XCEOF'
@@ -2136,13 +2157,14 @@ while IFS= read -r line; do
 done < "$XACC"
 if [ "$changed" -eq 1 ]; then mv "$tmp" "$XACC"; /usr/local/bin/xray-gen; else rm -f "$tmp"; fi
 XCEOF
-chmod +x /usr/local/bin/xray-check
+chmod +x /usr/local/bin/xray-check 2>/dev/null \
+    || warn "Could not mark Xray quota checker executable"
 
 # --- cron: run the checker every 10 minutes ------------------------------
 cat > /etc/cron.d/xray-check <<'EOF'
 */10 * * * * root /usr/local/bin/xray-check >/dev/null 2>&1
 EOF
-chmod 644 /etc/cron.d/xray-check
+chmod 644 /etc/cron.d/xray-check 2>/dev/null || true
 command -v cron >/dev/null 2>&1 || eval "$APT cron" </dev/null >/dev/null 2>&1 || true
 systemctl enable cron >/dev/null 2>&1 || true
 systemctl restart cron >/dev/null 2>&1 || true
@@ -3417,7 +3439,8 @@ while true; do
 done
 MENUEOF
 
-chmod +x /usr/local/bin/menu
+chmod +x /usr/local/bin/menu 2>/dev/null \
+    || warn "Could not mark management menu executable"
 success "Management panel installed — type 'menu' to open it"
 
 # ═══════════════════════════════════════════
@@ -3470,7 +3493,8 @@ echo -e "  ${TEAL}╰───────────────────�
 echo -e "        ${GRY}type${NC} ${W}${BOLD}menu${NC} ${GRY}to open the control panel${NC}"
 echo ""
 MOTDEOF
-chmod +x /etc/update-motd.d/00-litronx
+chmod +x /etc/update-motd.d/00-litronx 2>/dev/null \
+    || warn "Could not enable login watermark"
 # OpenSSH on Debian renders update-motd.d through pam_motd; make sure the
 # static-motd printer is also enabled so pam runs the dynamic scripts.
 grep -q 'pam_motd.so motd=/run/motd.dynamic' /etc/pam.d/sshd 2>/dev/null || true
@@ -3484,16 +3508,53 @@ success "Login watermark installed — shows on every server login"
 phase "Default users"
 DEFAULT_USER_PASS="0000"
 DEFAULT_USER_DAYS=30
-DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d")
+DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d" 2>/dev/null)
+[ -n "$DEFAULT_USER_EXP" ] || DEFAULT_USER_EXP="never"
 for U in deon febo geto weon ceon; do
     if id "$U" >/dev/null 2>&1; then
         info "User '$U' already exists — skipped"
     else
-        useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U"
-        echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
-        success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
+        if [ "$DEFAULT_USER_EXP" = "never" ]; then
+            CREATE_USER_CMD=(useradd -M -s /bin/false "$U")
+        else
+            CREATE_USER_CMD=(useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U")
+        fi
+        if "${CREATE_USER_CMD[@]}" >/dev/null 2>&1 \
+           && id "$U" >/dev/null 2>&1 \
+           && echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1; then
+            success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
+        else
+            warn "Could not create default user '$U' — continuing"
+        fi
     fi
 done
+
+# Final health pass: retry only services that are not active. Already-working
+# protocols are never restarted or disturbed. SlowDNS is checked only when the
+# user supplied an NS domain; Xray intentionally remains off until activated
+# from its menu.
+FINAL_SERVICE_WARNINGS=""
+ensure_active() {
+    local unit="$1" label="$2"
+    systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+    timeout 30 systemctl restart "$unit" >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+        FINAL_SERVICE_WARNINGS="${FINAL_SERVICE_WARNINGS}${FINAL_SERVICE_WARNINGS:+, }${label}"
+        return 1
+    fi
+}
+
+if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+    ensure_active ssh "OpenSSH" || true
+else
+    ensure_active sshd "OpenSSH" || true
+fi
+ensure_active dropbear "Dropbear" || true
+ensure_active ws-proxy "WebSocket" || true
+ensure_active stunnel4 "SSL/Stunnel" || true
+if [ -n "$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)" ]; then
+    ensure_active slowdns "SlowDNS" || true
+fi
 
 # ═══════════════════════════════════════════
 # FINAL MESSAGE
@@ -3502,7 +3563,11 @@ UI_SILENT=0
 _ELAPSED=$(( SECONDS - INSTALL_T0 ))
 clear
 echo ""
-echo -e "  ${LIME}${BOLD}  ✔  INSTALLATION COMPLETE${NC}   ${GRY}all protocols installed in ${BWHITE}${_ELAPSED}s${GRY}.${NC}"
+echo -e "  ${LIME}${BOLD}  ✔  INSTALLATION COMPLETE${NC}   ${GRY}all setup phases completed in ${BWHITE}${_ELAPSED}s${GRY}.${NC}"
+if [ -n "$FINAL_SERVICE_WARNINGS" ]; then
+    echo -e "  ${BYellow}${BOLD}  ⚠  Needs attention:${NC} ${BWHITE}${FINAL_SERVICE_WARNINGS}${NC}"
+    echo -e "  ${GRY}Run ${BWHITE}systemctl status <service>${GRY} or open ${BWHITE}menu → Service status${GRY}.${NC}"
+fi
 echo ""
 echo -e "  ${TEAL}╭──────────────────────────────────────────────────────╮${NC}"
 printf  "  ${TEAL}│${NC}  ${SKY}◆${NC} %-13s ${BWHITE}${BOLD}%-33.33s${NC}${TEAL}│${NC}\n" "Host / Domain" "${DOMAIN:-$SERVER_IP}"
