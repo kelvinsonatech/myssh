@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "6KCEbD66iW3jpjau0VOT9"
+uri = "file://ssh-ssl-setup.sh"
+type = "unspecified"
+title = "SSH SSL Setup Script"
+description = "Restored working installer with the original Fast DNS menu option."
+logical_id = "9d75e4c7-90f9-458b-a494-2715308b752b"
+content_hash = "sha256:496b3ec45e7dfdc81141af36c839762d8ebe885a690c64feaff5e5ac2d58058f"
+size = 152401
+mtime_ms = 1788554078293
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/9d75e4c7-90f9-458b-a494-2715308b752b/1cf3ddb3-673d-4bfb-b439-7a880089f4c2"
+storage_version_token = "1788554162955168"
+content_type = "application/octet-stream"
