@@ -203,7 +203,7 @@ wait_for_apt() {
 }
 
 run_apt_update() {
-    local force_ipv4="${1:-0}"
+    local force_ipv4="${1:-0}" allow_expired="${2:-0}"
     local args=(
         -o Acquire::Retries=3
         -o Acquire::http::Timeout=30
@@ -211,6 +211,11 @@ run_apt_update() {
         -o Dpkg::Use-Pty=0
     )
     [ "$force_ipv4" = "1" ] && args+=(-o Acquire::ForceIPv4=true)
+    # Debian 11 reached EOL on 2026-08-31. Its last signed security Release
+    # metadata can therefore be expired even though the signed packages are
+    # still available. Apply this exception only to Bullseye and only after apt
+    # explicitly reports expiry; never weaken validation for Debian 12+.
+    [ "$allow_expired" = "1" ] && args+=(-o Acquire::Check-Valid-Until=false)
     apt-get update "${args[@]}" </dev/null >"$APT_UPDATE_LOG" 2>&1
 }
 
@@ -221,7 +226,22 @@ if ! wait_for_apt; then
     exit 1
 fi
 
-if ! run_apt_update 0 && ! run_apt_update 1; then
+APT_UPDATE_OK=0
+run_apt_update 0 && APT_UPDATE_OK=1
+[ "$APT_UPDATE_OK" = "1" ] || { run_apt_update 1 && APT_UPDATE_OK=1; }
+
+# Bullseye's final security metadata expired after Debian 11 EOL. Keep normal
+# signature verification, but ignore only the no-longer-renewed Valid-Until
+# timestamp. This preserves existing Hetzner/Debian sources and package signing.
+if [ "$APT_UPDATE_OK" != "1" ]; then
+    DEBIAN_CODENAME=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+    if [ "$DEBIAN_CODENAME" = "bullseye" ] \
+       && grep -qiE 'Release file .* is expired|invalid since' "$APT_UPDATE_LOG"; then
+        run_apt_update 1 1 && APT_UPDATE_OK=1
+    fi
+fi
+
+if [ "$APT_UPDATE_OK" != "1" ]; then
     printf '\n'
     warn "Debian package lists could not be updated. Nothing was installed or changed."
     echo -e "${BRed}──────────────── apt error ────────────────${NC}"
