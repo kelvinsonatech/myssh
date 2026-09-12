@@ -634,13 +634,12 @@ success "Stunnel running — SSL 443 (payload) & 447 (direct SSH)"
 # ═══════════════════════════════════════════
 phase "Firewall rules"
 if command -v ufw >/dev/null 2>&1; then
-    for P in 22 80 109 143 443 447; do
-        ufw allow ${P}/tcp >/dev/null 2>&1
-    done
-    ufw allow 53/udp >/dev/null 2>&1   # SlowDNS (dnstt) tunnel
-    success "UFW rules applied"
+    # The general firewall is controlled manually from the management menu.
+    # Never enable it or add rules during installation: an administrator must
+    # explicitly choose Firewall control -> Enable firewall.
+    success "UFW available — activation is manual from the management menu"
 else
-    warn "ufw not found — open TCP ports manually: 22 80 109 143 443 447 + 53/udp"
+    warn "ufw not found — install it before using menu > Firewall control"
 fi
 
 # ═══════════════════════════════════════════
@@ -2691,6 +2690,7 @@ show_links() {  # remark
 
 xray_open_ports() {
     command -v ufw >/dev/null 2>&1 || return
+    ufw status 2>/dev/null | grep -qi '^Status: active' || return
     for P in $VM_WS_TLS $VM_WS_NONE $VM_HTTP_NONE $VM_HTTP_TLS $VM_SPLIT_TLS $VM_SPLIT_NONE \
              $VL_WS_TLS $VL_WS_NONE $VL_HTTP_NONE $VL_HTTP_TLS $VL_SPLIT_TLS $VL_SPLIT_NONE \
              $TR_WS_TLS $TR_WS_NONE $TR_HTTP_NONE $TR_HTTP_TLS $TR_SPLIT_TLS $TR_SPLIT_NONE; do
@@ -3307,6 +3307,121 @@ hysteria_menu() {
     done
 }
 
+# ── GENERAL FIREWALL — manually controlled only ──────────
+# Enabling is lockout-safe: all SSH/service rules are installed before UFW is
+# switched on. Disabling UFW never stops or modifies any tunnel service.
+firewall_status() {
+    command -v ufw >/dev/null 2>&1 || { echo "missing"; return; }
+    if ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        echo "active"
+    else
+        echo "inactive"
+    fi
+}
+
+firewall_allow_tcp() {
+    local p
+    for p in "$@"; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        ufw allow "${p}/tcp" >/dev/null 2>&1 || return 1
+    done
+}
+
+firewall_enable() {
+    section "ENABLE GENERAL FIREWALL" "$LIME"
+    if ! command -v ufw >/dev/null 2>&1; then
+        err "UFW is not installed. Run: apt-get install -y ufw"
+        pause; return
+    fi
+
+    note "Preparing every required rule before activation..."
+
+    # Core services. SSH is first so activation cannot lock out this session.
+    firewall_allow_tcp 22 80 109 143 443 447 || {
+        err "Could not prepare the core rules. Firewall was not enabled."
+        pause; return
+    }
+
+    # Also preserve any custom OpenSSH ports currently configured.
+    local p
+    while read -r p; do
+        [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "${p}/tcp" >/dev/null 2>&1
+    done < <(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
+
+    # Xray ports are added only when Xray is configured.
+    if [ -s "$XCONF" ]; then
+        firewall_allow_tcp \
+            "$VM_WS_TLS" "$VM_WS_NONE" "$VM_HTTP_NONE" "$VM_HTTP_TLS" "$VM_SPLIT_TLS" "$VM_SPLIT_NONE" \
+            "$VL_WS_TLS" "$VL_WS_NONE" "$VL_HTTP_NONE" "$VL_HTTP_TLS" "$VL_SPLIT_TLS" "$VL_SPLIT_NONE" \
+            "$TR_WS_TLS" "$TR_WS_NONE" "$TR_HTTP_NONE" "$TR_HTTP_TLS" "$TR_SPLIT_TLS" "$TR_SPLIT_NONE"
+    fi
+
+    # SlowDNS and Hysteria rules are added only when those services exist.
+    if systemctl is-active --quiet slowdns 2>/dev/null; then
+        ufw allow 53/udp >/dev/null 2>&1
+    fi
+    if systemctl is-active --quiet hysteria 2>/dev/null; then
+        ufw allow "${HY_PORT}/udp" >/dev/null 2>&1
+        ufw allow "${HY_HOP_LO}:${HY_HOP_HI}/udp" >/dev/null 2>&1
+    fi
+
+    ufw default allow outgoing >/dev/null 2>&1
+    if ! ufw --force enable >/dev/null 2>&1; then
+        err "UFW activation failed. Existing protocols were not changed."
+        pause; return
+    fi
+
+    echo ""
+    local col="$G"; line_top "$col"
+    crow "$col" "${W}${BOLD}🛡 FIREWALL ENABLED${NC}"; line_mid "$col"
+    row "$col" "${GR}SSH was allowed before activation to prevent lockout.${NC}"
+    row "$col" "${GR}Only installed protocol ports were opened.${NC}"
+    line_bot "$col"
+    pause
+}
+
+firewall_disable() {
+    section "DISABLE GENERAL FIREWALL" "$ORANGE"
+    if ! command -v ufw >/dev/null 2>&1; then
+        note "UFW is not installed."; pause; return
+    fi
+    if [ "$(firewall_status)" != "active" ]; then
+        note "General firewall is already inactive."; pause; return
+    fi
+    if ufw --force disable >/dev/null 2>&1; then
+        ok "General firewall disabled. No protocol or service was stopped."
+    else
+        err "Could not disable UFW. Check: ufw status verbose"
+    fi
+    pause
+}
+
+firewall_menu() {
+    while true; do
+        section "GENERAL FIREWALL CONTROL" "$ORANGE"
+        local state display
+        state=$(firewall_status)
+        case "$state" in
+            active)   display="${G}● enabled${NC}" ;;
+            inactive) display="${GR}○ disabled${NC}" ;;
+            *)        display="${R}○ UFW not installed${NC}" ;;
+        esac
+        echo -e "  ${GR}Status${NC} : $display"
+        echo -e "  ${GR}The installer never activates this firewall automatically.${NC}\n"
+        menu_item "1" "🛡 " "Enable firewall safely" "$G"
+        menu_item "2" "🧹" "Disable firewall"        "$ORANGE"
+        menu_item "0" "↩ " "Back to main menu"      "$GR"
+        echo ""
+        read -rp "$(echo -e "  ${ORANGE}❯${NC} select an option : ")" FWOPT
+        case "$FWOPT" in
+            1) firewall_enable ;;
+            2) firewall_disable ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
 menu_item() {  # menu_item NUM ICON "Label" color
     echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
 }
@@ -3329,6 +3444,7 @@ while true; do
     menu_item "12" "🛡 " "Abuse protection"        "$LIME"
     menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
+    menu_item "15" "🛡 " "Firewall control"         "$ORANGE"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -3347,6 +3463,7 @@ while true; do
         12) abuse_menu ;;
         13) hysteria_menu ;;
         14) fastdns_menu ;;
+        15) firewall_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
