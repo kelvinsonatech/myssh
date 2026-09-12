@@ -182,7 +182,54 @@ APT="apt-get install -y \
     -o Dpkg::Options::='--force-confold'"
 
 phase "System packages"
-apt-get update -y </dev/null >/dev/null 2>&1
+
+# Debian cloud images can start apt-daily immediately after first boot. The old
+# command hid apt's error and, because this installer uses `set -e`, terminated
+# the entire script at 8% with no explanation. Wait for package-manager locks,
+# retry transient mirror failures, then retry over IPv4 (some Hetzner instances
+# have working IPv4 before their IPv6 route is ready). Never delete lock files.
+APT_UPDATE_LOG=/tmp/ssh-vpn-apt-update.log
+
+wait_for_apt() {
+    local waited=0
+    command -v fuser >/dev/null 2>&1 || return 0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+          /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        [ "$waited" -ge 120 ] && return 1
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 0
+}
+
+run_apt_update() {
+    local force_ipv4="${1:-0}"
+    local args=(
+        -o Acquire::Retries=3
+        -o Acquire::http::Timeout=30
+        -o Acquire::https::Timeout=30
+        -o Dpkg::Use-Pty=0
+    )
+    [ "$force_ipv4" = "1" ] && args+=(-o Acquire::ForceIPv4=true)
+    apt-get update "${args[@]}" </dev/null >"$APT_UPDATE_LOG" 2>&1
+}
+
+if ! wait_for_apt; then
+    printf '\n'
+    warn "Another apt/dpkg process is still running after 2 minutes."
+    warn "Wait for apt-daily to finish, then run this installer again."
+    exit 1
+fi
+
+if ! run_apt_update 0 && ! run_apt_update 1; then
+    printf '\n'
+    warn "Debian package lists could not be updated. Nothing was installed or changed."
+    echo -e "${BRed}──────────────── apt error ────────────────${NC}"
+    tail -n 12 "$APT_UPDATE_LOG" 2>/dev/null || true
+    echo -e "${BRed}────────────────────────────────────────────${NC}"
+    echo -e "${BYellow}Check the repository/DNS error above, then run the script again.${NC}"
+    exit 1
+fi
 
 # ═══════════════════════════════════════════
 # SECTION 1 — OPENSSH
