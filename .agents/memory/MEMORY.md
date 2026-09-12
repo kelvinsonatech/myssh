@@ -5,5 +5,3 @@
 - [Browser DoH bypass](abuse-guard-doh-bypass.md) — Google-result bypass = browser DoH on 443; poison ~45 DoH bootstrap hostnames + Firefox canary NXDOMAIN, never touch 443.
 - [Hysteria UDP tunnel](hysteria-udp.md) — menu 13; user:pass auth, obfs, port-hop UDP 20000-50000→36712; UDP-only so can't break TCP protocols; NOT for zero-data/payload.
 - [SlowDNS UDP 53](slowdns-udp53.md) — dnstt silently fails unless port 53 is freed (disable systemd-resolved stub); verify is-active after start.
-- [Manual general firewall](manual-general-firewall.md) — UFW must only be enabled/disabled from menu; allow SSH before enable; services may add rules only while UFW is already active.
-- [Hetzner Debian apt startup](hetzner-debian-apt.md) — first-boot apt locks, transient mirrors, or IPv6 can stop phase 1; never hide apt-update failure under set -e.
