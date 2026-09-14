@@ -32,6 +32,19 @@ matching the SSL-payload backend. Working impl landed after the errexit guard.
 
 ## Dependency versions can block the dnstt build
 
+The user's VPS failure was subsequently confirmed as Go 1.19 lacking
+`crypto/ecdh`, with no fallback compiler installed. Do not confuse a workspace
+package-filter failure with the VPS root cause. Even the previously selected
+dependency pins were later blocked here; a past successful build is not a
+current security clearance.
+
+**Why:** download errors were suppressed and a redirect response was mistaken
+for verification of a successful compiler download.
+
+**How to apply:** verify the full download and compiler execution, retain
+fallback download/extraction logs, and isolate the temporary compiler rather
+than deleting a server-wide Go installation.
+
 Current dnstt source may pin old `golang.org/x/*` modules that security-aware
 package proxies reject, even when the installed Go compiler is new enough.
 
