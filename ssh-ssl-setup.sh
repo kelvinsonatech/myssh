@@ -1771,10 +1771,22 @@ if [ -n "$NS_DOMAIN" ]; then
         _try_build() {   # $1 = path to a go binary
             [ -x "$1" ] || command -v "$1" >/dev/null 2>&1 || return 1
             [ -d /root/dnstt/dnstt-server ] || return 1
-            ( cd /root/dnstt/dnstt-server \
-              && export HOME=/root GOCACHE=/tmp/gocache GOPATH=/tmp/gopath GOFLAGS=-mod=mod \
-              && "$1" build -o dnstt-server . >/dev/null 2>&1 \
-              && install -m 0755 dnstt-server /usr/local/bin/dnstt-server )
+            (
+              cd /root/dnstt || exit 1
+              export HOME=/root GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
+              export GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org,direct
+              # Upstream currently pins old x/* modules that some package
+              # security filters reject. Use patched Go 1.22-compatible
+              # versions before building.
+              "$1" get golang.org/x/crypto@v0.31.0 \
+                  golang.org/x/net@v0.33.0 \
+                  golang.org/x/sys@v0.28.0 \
+                  golang.org/x/text@v0.21.0 || exit 1
+              cd dnstt-server || exit 1
+              "$1" build -o /tmp/dnstt-server . \
+                  && /tmp/dnstt-server -help >/dev/null 2>&1 \
+                  && install -m 0755 /tmp/dnstt-server /usr/local/bin/dnstt-server
+            ) >>/tmp/dnstt-build.log 2>&1
         }
 
         # 1) try whatever `go` apt gave us (fast path on modern distros)
@@ -1791,7 +1803,7 @@ if [ -n "$NS_DOMAIN" ]; then
                 *)             GOA=amd64;;
             esac
             if curl -fsSL --connect-timeout 25 -o /tmp/go.tgz \
-                 "https://go.dev/dl/go1.22.5.linux-${GOA}.tar.gz" >/dev/null 2>&1; then
+                 "https://go.dev/dl/go1.22.12.linux-${GOA}.tar.gz" >/dev/null 2>&1; then
                 rm -rf /usr/local/go; tar -C /usr/local -xzf /tmp/go.tgz >/dev/null 2>&1
                 rm -f /tmp/go.tgz
                 _try_build /usr/local/go/bin/go
@@ -1832,6 +1844,8 @@ EOF
         fi
     else
         warn "SlowDNS skipped — could not build dnstt-server (install continues)"
+        [ -s /tmp/dnstt-build.log ] \
+            && warn "Build details saved at /tmp/dnstt-build.log"
     fi
 else
     info "SlowDNS skipped — no NS domain provided"
