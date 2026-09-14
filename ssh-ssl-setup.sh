@@ -3423,10 +3423,19 @@ DEFAULT_USER_DAYS=30
 DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d")
 for U in deon febo geto weon ceon; do
     if id "$U" >/dev/null 2>&1; then
-        info "User '$U' already exists — skipped"
+        # These are installer-managed demo accounts. Re-runs must synchronize
+        # their documented credentials instead of leaving an old password,
+        # locked state, expired date, or incompatible shell behind. SlowDNS
+        # authenticates through OpenSSH, so any of those appears in the client
+        # as "wrong username/password".
+        usermod -s /bin/false -e "$DEFAULT_USER_EXP" "$U" >/dev/null 2>&1 || true
+        echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
+        passwd -u "$U" >/dev/null 2>&1 || true
+        success "User '$U' synchronized (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
     else
         useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U"
         echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
+        passwd -u "$U" >/dev/null 2>&1 || true
         success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
     fi
 done
