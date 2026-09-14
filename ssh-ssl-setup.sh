@@ -1800,14 +1800,33 @@ if [ -n "$NS_DOMAIN" ]; then
                 amd64|x86_64)  GOA=amd64;;
                 arm64|aarch64) GOA=arm64;;
                 armhf|armv7l)  GOA=armv6l;;
-                *)             GOA=amd64;;
+                *)             GOA="";;
             esac
-            if curl -fsSL --connect-timeout 25 -o /tmp/go.tgz \
-                 "https://go.dev/dl/go1.22.12.linux-${GOA}.tar.gz" >/dev/null 2>&1; then
-                rm -rf /usr/local/go; tar -C /usr/local -xzf /tmp/go.tgz >/dev/null 2>&1
-                rm -f /tmp/go.tgz
-                _try_build /usr/local/go/bin/go
+            # Build with an isolated compiler: never delete the server's Go
+            # installation. Record download/extraction errors, not just build errors.
+            GO_TMP=$(mktemp -d /tmp/slowdns-go.XXXXXXXX)
+            if [ -n "$GOA" ] && [ -d "$GO_TMP" ]; then
+                GO_DOWNLOADED=0
+                for GO_HOST in https://dl.google.com/go https://go.dev/dl; do
+                    if curl -fL --retry 2 --connect-timeout 25 --max-time 240 \
+                        -o "$GO_TMP/go.tgz" \
+                        "$GO_HOST/go1.22.12.linux-${GOA}.tar.gz" \
+                        >>/tmp/dnstt-build.log 2>&1; then
+                        GO_DOWNLOADED=1
+                        break
+                    fi
+                done
+                if [ "$GO_DOWNLOADED" = 1 ] \
+                    && tar -C "$GO_TMP" -xzf "$GO_TMP/go.tgz" >>/tmp/dnstt-build.log 2>&1 \
+                    && "$GO_TMP/go/bin/go" version >>/tmp/dnstt-build.log 2>&1; then
+                    _try_build "$GO_TMP/go/bin/go"
+                else
+                    warn "SlowDNS compiler download/extraction failed — see /tmp/dnstt-build.log"
+                fi
+            else
+                warn "SlowDNS compiler unavailable for '$ARCH' or temporary directory could not be created"
             fi
+            [ -n "$GO_TMP" ] && rm -rf -- "$GO_TMP"
         fi
     fi
 
