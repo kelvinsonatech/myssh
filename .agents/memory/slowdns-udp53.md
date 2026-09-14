@@ -29,3 +29,17 @@ no `menu`). Wrap the entire phase in `set +e` … `set -e`. Toolchain: try apt
 `golang-go` first, fall back to the official go.dev tarball (arch-aware) — apt's
 Go can be too old to build current dnstt. Backend is `127.0.0.1:22` (OpenSSH),
 matching the SSL-payload backend. Working impl landed after the errexit guard.
+
+## Dependency versions can block the dnstt build
+
+Current dnstt source may pin old `golang.org/x/*` modules that security-aware
+package proxies reject, even when the installed Go compiler is new enough.
+
+**Why:** the build failed while fetching an old `x/crypto` release because the
+package network blocked its known critical vulnerability. Since build output was
+discarded, the installer only reported a generic failure.
+
+**How to apply:** before building, upgrade the pinned `x/crypto`, `x/net`,
+`x/sys`, and `x/text` modules to patched releases compatible with the fallback Go
+toolchain. Keep the source build as the trusted path, validate the produced
+binary, and preserve `/tmp/dnstt-build.log` when installation still fails.
