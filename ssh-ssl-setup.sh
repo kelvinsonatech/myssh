@@ -3419,24 +3419,15 @@ success "Login watermark installed — shows on every server login"
 # ═══════════════════════════════════════════
 phase "Default users"
 DEFAULT_USER_PASS="0000"
+DEFAULT_USER_DAYS=30
+DEFAULT_USER_EXP=$(date -d "+${DEFAULT_USER_DAYS} days" +"%Y-%m-%d")
 for U in deon febo geto weon ceon; do
     if id "$U" >/dev/null 2>&1; then
-        # These are installer-managed demo accounts. Re-runs must synchronize
-        # their documented credentials instead of leaving an old password,
-        # locked state, account/password expiry, inactivity lock, or incompatible
-        # shell behind. SlowDNS authenticates through OpenSSH/PAM, where any of
-        # those can appear in the client as "username or password expired".
-        usermod -s /bin/false -e '' "$U" >/dev/null 2>&1 || true
-        echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
-        passwd -u "$U" >/dev/null 2>&1 || true
-        chage -E -1 -I -1 -m 0 -M 99999 -W 7 "$U" >/dev/null 2>&1 || true
-        success "User '$U' synchronized (pass: ${DEFAULT_USER_PASS}, no expiry)"
+        info "User '$U' already exists — skipped"
     else
-        useradd -M -s /bin/false "$U"
+        useradd -e "$DEFAULT_USER_EXP" -M -s /bin/false "$U"
         echo -e "${DEFAULT_USER_PASS}\n${DEFAULT_USER_PASS}" | passwd "$U" >/dev/null 2>&1
-        passwd -u "$U" >/dev/null 2>&1 || true
-        chage -E -1 -I -1 -m 0 -M 99999 -W 7 "$U" >/dev/null 2>&1 || true
-        success "User '$U' created (pass: ${DEFAULT_USER_PASS}, no expiry)"
+        success "User '$U' created (pass: ${DEFAULT_USER_PASS}, expires: ${DEFAULT_USER_EXP})"
     fi
 done
 
