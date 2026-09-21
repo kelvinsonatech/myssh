@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "m9xvWO_B2ixEJOw7N3bc8"
+uri = "file://deliverables/LitronShield-payload-fix.zip"
+type = "unspecified"
+title = "LitronShield payload compatibility patch"
+description = "Three Java source files, installation instructions and handshake tests. No signing keys or credentials included; rebuild in Android Studio."
+logical_id = "d478fd62-c0cd-430d-b3f3-66f01273ba11"
+content_hash = "sha256:09c97705fff39de952129bc304db74bcb1a21baa2b4dae24dcdaca8e49d72d4f"
+size = 10240
+mtime_ms = 1790017084292
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/d478fd62-c0cd-430d-b3f3-66f01273ba11/b3fa347a-9e6c-49ee-9d07-994a4b4041a0"
+storage_version_token = "1790017088942228"
+content_type = "application/octet-stream"
