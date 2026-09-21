@@ -42,3 +42,31 @@ mtime_ms = 1790018133994
 storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/e463116a-0e8f-423e-8929-1a9559a4dcbb/9153e6b8-51cd-483d-8709-c83e9fb70387"
 storage_version_token = "1790018157910931"
 content_type = "application/octet-stream"
+
+[[outputs]]
+id = "kX8bvOsVgsTt1vB1fz5Li"
+uri = "file://deliverables/LitronShield-stability-debug.apk"
+type = "unspecified"
+title = "LitronShield — SSH stability update"
+description = "Debug APK with SSH keepalive, preserved TCP_NODELAY for custom payloads, safer reconnect handling and retained diagnostics. Build, signature and focused tests passed; Ubuntu/device stability not yet confirmed."
+logical_id = "43847468-ceb8-4624-88a1-6ea182bebd9a"
+content_hash = "sha256:e8289d2617bd8274d4d6b1885068bb8c0ba16b3471315f25a27c031994719956"
+size = 73763662
+mtime_ms = 1790019286522
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/43847468-ceb8-4624-88a1-6ea182bebd9a/005a6f1e-b779-44fc-a432-dfc2b2b86832"
+storage_version_token = "1790019298016842"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "LLprxFEDSqglRtDBpRFKD"
+uri = "file://deliverables/LitronShield-stability-source-patch.zip"
+type = "unspecified"
+title = "Matching source patch"
+description = "Changed Java files and tests for this APK. No signing keystore or credentials included."
+logical_id = "e1dd19ee-d88d-4293-b473-8b575e4c8a53"
+content_hash = "sha256:af622f52716551f3debafae23bc72a3b148684691d3f307512689ddaf4d5f98a"
+size = 20192
+mtime_ms = 1790019286547
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/e1dd19ee-d88d-4293-b473-8b575e4c8a53/876fe4bb-c65b-4565-bc76-a1f33b195488"
+storage_version_token = "1790019298541747"
+content_type = "application/octet-stream"
