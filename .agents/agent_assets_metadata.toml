@@ -28,3 +28,17 @@ mtime_ms = 1790017441375
 storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/046a6aaa-24fd-4c6c-a27c-f187a1081e17/26d97928-f75b-41fb-86a5-ce10efbf334e"
 storage_version_token = "1790017449565797"
 content_type = "application/octet-stream"
+
+[[outputs]]
+id = "o7iiZi08z2wozLBjMuZvM"
+uri = "file://deliverables/LitronShield-fast-connect-debug.apk"
+type = "unspecified"
+title = "LitronShield — connection startup update"
+description = "Removes redundant SSL socket connection and enables TCP_NODELAY. Build, signature and 11 payload handshake checks passed. Device speed not yet measured."
+logical_id = "e463116a-0e8f-423e-8929-1a9559a4dcbb"
+content_hash = "sha256:6cb0ff98f4fe6f89cdfd0ccf34a45cb432b78fc8314e3f9bcc1f74b86129bfd4"
+size = 73762258
+mtime_ms = 1790018133994
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/e463116a-0e8f-423e-8929-1a9559a4dcbb/9153e6b8-51cd-483d-8709-c83e9fb70387"
+storage_version_token = "1790018157910931"
+content_type = "application/octet-stream"

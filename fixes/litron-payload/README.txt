@@ -12,6 +12,13 @@ Scope:
 - Standard CONNECT, Dropbear bypass, payload tokens/splitting, TLS setup,
   authentication, other protocols and the server installer are unchanged.
 
+Connection startup update:
+- TLS now wraps the connected TCP socket instead of opening a second one.
+- The effective TLS destination, SNI and TLS-version preferences are retained.
+- TCP_NODELAY is enabled on HTTP/SSL payload sockets for small handshake writes.
+- SSL uses the caller's connection/read timeouts and closes on handshake error.
+- Explicit split delays and reconnection backoff have not been shortened.
+
 No APK or full Android build is included. Real Android/device compatibility
 has not been verified here. This fixes identified handshake defects, not a
 guarantee that any particular network or host accepts a payload.

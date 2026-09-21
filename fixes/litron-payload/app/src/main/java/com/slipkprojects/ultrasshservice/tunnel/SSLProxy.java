@@ -120,7 +120,10 @@ public class SSLProxy implements ProxyData {
 			throws IOException {
 
 		mSocket = SocketChannel.open().socket();
-		mSocket.connect(new InetSocketAddress(stunnelServer, stunnelPort));
+mSocket.setTcpNoDelay(true);
+// Use the same destination as the existing TLS connection, only once.
+mSocket.connect(new InetSocketAddress(hostname, port), connectTimeout);
+mSocket.setSoTimeout(readTimeout);
 
 		if (mSocket.isConnected()) {
 			mSocket = doSSLHandshake(hostname, stunnelHostSNI, port);
@@ -310,7 +313,9 @@ throw error;
 			KeyManager[] keyManagerArr = null;
 			sSLContext.init(keyManagerArr, trustAllCerts, new SecureRandom());
 			TLSSocketFactory tsf = new TLSSocketFactory();
-			SSLSocket socket = (SSLSocket) tsf.createSocket(host, port);
+SSLSocket socket = (SSLSocket) tsf.createSocket(mSocket, host, port, true);
+socket.setTcpNoDelay(true);
+socket.setSoTimeout(mSocket.getSoTimeout());
 			try {
 				socket.getClass().getMethod("setHostname", String.class).invoke(socket, sni);
 			} catch (Throwable e) {
@@ -321,8 +326,8 @@ throw error;
 			SkStatus.logInfo("Starting SSL Handshake...");
 			return socket;
 		} catch (Exception e) {
-			IOException iOException = new IOException(
-					new StringBuffer().append("Could not do SSL handshake").toString());
+try { mSocket.close(); } catch (IOException ignored) {}
+IOException iOException = new IOException("Could not do SSL handshake", e);
 			throw iOException;
 		}}
 }
