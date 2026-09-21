@@ -14,3 +14,17 @@ mtime_ms = 1790017084292
 storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/d478fd62-c0cd-430d-b3f3-66f01273ba11/b3fa347a-9e6c-49ee-9d07-994a4b4041a0"
 storage_version_token = "1790017088942228"
 content_type = "application/octet-stream"
+
+[[outputs]]
+id = "v2xMBemAjXJVH3rtMcwof"
+uri = "file://deliverables/LitronShield-payload-fix-debug.apk"
+type = "unspecified"
+title = "LitronShield — patched test APK"
+description = "Debug APK built from your uploaded source with the custom-payload handshake fix. Build and APK signature verified; not yet device-tested."
+logical_id = "046a6aaa-24fd-4c6c-a27c-f187a1081e17"
+content_hash = "sha256:6ab5f674f5cfeecb5844c557e6c3e63133b1ed84fad7cae953f92d3bae438afe"
+size = 73669279
+mtime_ms = 1790017441375
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/046a6aaa-24fd-4c6c-a27c-f187a1081e17/26d97928-f75b-41fb-86a5-ce10efbf334e"
+storage_version_token = "1790017449565797"
+content_type = "application/octet-stream"
