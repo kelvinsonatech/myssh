@@ -67,7 +67,6 @@ public class HttpProxyCustom
 	@Override
 	public Socket openConnection(String hostname, int port, int connectTimeout, int readTimeout) throws IOException {
 		sock = new Socket();
-sock.setTcpNoDelay(true);
 
 		InetAddress addr = TransportManager.createInetAddress(this.proxyHost);
 		sock.connect(new InetSocketAddress(addr, this.proxyPort), connectTimeout);
