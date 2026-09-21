@@ -47,14 +47,14 @@ content_type = "application/octet-stream"
 id = "kX8bvOsVgsTt1vB1fz5Li"
 uri = "file://deliverables/LitronShield-stability-debug.apk"
 type = "unspecified"
-title = "LitronShield — SSH stability update"
-description = "Debug APK with SSH keepalive, preserved TCP_NODELAY for custom payloads, safer reconnect handling and retained diagnostics. Build, signature and focused tests passed; Ubuntu/device stability not yet confirmed."
+title = "Download LitronShield APK"
+description = "Latest test APK with the payload fix, faster-startup changes and SSH keepalive. Install over the previous test version."
 logical_id = "43847468-ceb8-4624-88a1-6ea182bebd9a"
 content_hash = "sha256:e8289d2617bd8274d4d6b1885068bb8c0ba16b3471315f25a27c031994719956"
 size = 73763662
-mtime_ms = 1790019286522
-storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/43847468-ceb8-4624-88a1-6ea182bebd9a/005a6f1e-b779-44fc-a432-dfc2b2b86832"
-storage_version_token = "1790019298016842"
+mtime_ms = 1790019330411
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:8d8be441-1852-4b0c-93c8-2d1a1032ed25/43847468-ceb8-4624-88a1-6ea182bebd9a/1e3a3c50-77b2-4959-b1db-55aa6d70f687"
+storage_version_token = "1790019670056316"
 content_type = "application/octet-stream"
 
 [[outputs]]
