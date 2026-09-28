@@ -1744,7 +1744,12 @@ success "Bandwidth monitor active on ${PRIMARY_IFACE:-auto}"
 phase "SlowDNS (dnstt)"
 set +e
 NS_DOMAIN=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)
-if [ -n "$NS_DOMAIN" ]; then
+if [ -f /etc/hysteria2/slowdns.previous ] ||
+    [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+    # Hysteria 2 owns the negotiated UDP :53 handover. Re-running this
+    # installer must never enable SlowDNS, kill its listener or fuser -k HY2.
+    warn "SlowDNS skipped — UDP 53 belongs to Hysteria 2; use menu 15 to restore SlowDNS."
+elif [ -n "$NS_DOMAIN" ]; then
     systemctl stop slowdns >/dev/null 2>&1
     killall dnstt-server >/dev/null 2>&1
 
@@ -2466,6 +2471,14 @@ restart_services() {
     systemctl restart dropbear 2>/dev/null
     systemctl restart ws-proxy 2>/dev/null
     systemctl restart stunnel4 2>/dev/null
+    # SlowDNS must not reclaim UDP 53 during a persistent HY2 handover.
+    if [ -f /etc/hysteria2/slowdns.previous ] ||
+        [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+        note "SlowDNS left stopped: Hysteria 2 owns UDP 53 (menu 15 restores it)."
+    elif systemctl is-active --quiet slowdns.service 2>/dev/null; then
+        systemctl restart slowdns.service 2>/dev/null ||
+            err "SlowDNS failed to restart; inspect journalctl -u slowdns."
+    fi
     ok "All services restarted."
     pause
 }
@@ -3321,6 +3334,514 @@ hysteria_menu() {
     done
 }
 
+# Hysteria 2 is deliberately isolated from the Hysteria 1 binary, unit, data,
+# NAT range and firewall helper. Official v2.6.5 release digests (GitHub asset
+# metadata); do not use get.hy2.sh, which replaces the Hysteria 1 installation.
+HY2_DIR=/etc/hysteria2
+HY2_BIN=/usr/local/bin/hysteria2
+HY2_UNIT=/etc/systemd/system/hysteria2.service
+HY2_HOP=/usr/local/bin/hysteria2-firewall
+HY2_USERS=$HY2_DIR/accounts
+HY2_PORT_FILE=$HY2_DIR/port
+HY2_SLOW=$HY2_DIR/slowdns.previous
+
+hy2_install() {
+    local arch sha tmp
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; sha=8f33568e4b9df7fd848d6216e44b0eba913e330c5c4bb077b3e9a456f318235c ;;
+        aarch64|arm64) arch=arm64; sha=fa91dd02beaa4a36be8f959c62bfb7e2b3ba3304c7132f4f5fe97994312dc0a ;;
+        *) err "Hysteria 2 supports x86_64 and arm64 here."; return 1 ;;
+    esac
+    if [ -f "$HY2_BIN" ] && printf '%s  %s\n' "$sha" "$HY2_BIN" | sha256sum -c --status; then return 0; fi
+    # Never replace an installed binary without an explicit admin decision.
+    [ ! -e "$HY2_BIN" ] || { err "Unverified binary at $HY2_BIN; remove it manually first."; return 1; }
+    tmp=$(mktemp) || return 1
+    if ! curl -fLsS --retry 2 --max-time 90 -o "$tmp" \
+        "https://github.com/HyNetworks/hysteria/releases/download/app/v2.6.5/hysteria-linux-$arch" ||
+        ! printf '%s  %s\n' "$sha" "$tmp" | sha256sum -c --status; then
+        rm -f "$tmp"; err "Hysteria 2 download or pinned SHA256 verification failed."; return 1
+    fi
+    install -m 755 "$tmp" "$HY2_BIN"; local result=$?
+    rm -f "$tmp"
+    return "$result"
+}
+
+hy2_port_valid() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )) || return 1
+    (( 10#$1 < 20000 || 10#$1 > 50000 )) || return 1
+    (( 10#$1 < 51000 || 10#$1 > 51999 )) || return 1
+}
+
+hy2_slow_configured() {
+    [ -f /etc/systemd/system/slowdns.service ] &&
+        grep -Eq 'ExecStart=.*dnstt-server.*-udp[[:space:]]+:53([[:space:]]|$)' /etc/systemd/system/slowdns.service
+}
+
+# True when an existing NAT destination-port range intersects the proposed
+# socket or hop pool. Inspect *all* NAT chains, including chains jumped from
+# PREROUTING; a dangling rule is still a conflict.
+hy2_nat_conflict() {
+    local lo="$1" hi="$2" rule spec part first last
+    while IFS= read -r rule; do
+        [[ "$rule" == *' -p udp '* || "$rule" == *' -p 17 '* ]] || continue
+        [[ "$rule" =~ --dports?[[:space:]]+([^[:space:]]+) ]] || continue
+        spec=${BASH_REMATCH[1]}
+        while IFS= read -r part; do
+            part=${part//:/-}
+            first=${part%%-*}; last=${part##*-}
+            # If we cannot parse a UDP port predicate, refuse rather than
+            # declaring the range safe.
+            [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || return 0
+            (( first > hi || last < lo )) || return 0
+        done < <(printf '%s\n' "$spec" | tr ',' '\n')
+    done <<< "$HY2_NAT4"$'\n'"$HY2_NAT6"
+    return 1
+}
+
+# Inspect nftables as well as both iptables address families. Unknown nft
+# expressions (sets, inverted predicates, etc.) are not proof of a free port.
+hy2_nft_conflict() {
+    local lo="$1" hi="$2" rule spec part first last
+    while IFS= read -r rule; do
+        # Plain firewall ACCEPT rules (e.g. UFW allowing SlowDNS) do not
+        # own a port. Only redirection/proxy rules can intercept the listener.
+        [[ "$rule" =~ (dnat|redirect|tproxy) ]] || continue
+        [[ "$rule" == *'udp dport '* || "$rule" == *'th dport '* ]] || continue
+        if [[ "$rule" =~ (udp|th)[[:space:]]+dport[[:space:]]+(\{[^}]*\}|[^[:space:]]+) ]]; then
+            spec=${BASH_REMATCH[2]}
+        else
+            return 0
+        fi
+        spec=$(printf '%s' "$spec" | tr -d '[:space:]{}')
+        [[ "$spec" == *'!'* || "$spec" == *'@'* ]] && return 0
+        while IFS= read -r part; do
+            part=${part//:/-}
+            first=${part%%-*}; last=${part##*-}
+            [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || return 0
+            (( first > hi || last < lo )) || return 0
+        done < <(printf '%s\n' "$spec" | tr ',' '\n')
+    done <<< "$HY2_NFT"
+    return 1
+}
+
+# Exit on inspection errors instead of interpreting failed commands as empty
+# rulesets. Check IPv6 NAT even if the chosen interface is IPv4.
+hy2_missing_tools() {
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local tool
+    for tool in ss iptables ip6tables nft; do
+        command -v "$tool" >/dev/null 2>&1 || printf '%s\n' "$tool"
+    done
+}
+
+hy2_prepare_tools() {
+    local missing answer
+    missing=$(hy2_missing_tools)
+    # Command substitution runs in a subshell; fix this shell's PATH too.
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    [ -n "$missing" ] || return 0
+    note "Missing network inspection tools: ${missing//$'\n'/, }"
+    command -v apt-get >/dev/null 2>&1 ||
+        { err "Install iproute2, iptables and nftables, then retry. No service was stopped."; return 1; }
+    read -rp "  Install missing inspection tools now? (y/N): " answer
+    [[ "$answer" = y || "$answer" = Y ]] ||
+        { err "Activation cancelled; no service was stopped."; return 1; }
+    # Install tooling only: never enable nftables, flush rules, change
+    # iptables alternatives, or upgrade/restart existing tunnel packages.
+    if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-install-recommends iproute2 iptables nftables; then
+        err "Tool installation failed. Check apt output above; no tunnel handover was attempted."
+        return 1
+    fi
+    missing=$(hy2_missing_tools)
+    [ -z "$missing" ] ||
+        { err "Still missing: ${missing//$'\n'/, }. Activation stopped."; return 1; }
+}
+
+hy2_snapshot() {
+    local missing
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    missing=$(hy2_missing_tools)
+    [ -z "$missing" ] ||
+        { err "Missing tools: ${missing//$'\n'/, }. Install iproute2 iptables nftables, then retry."; return 1; }
+    HY2_SS=$(ss -H -lunp 2>/dev/null) ||
+        { err "Could not inspect UDP listeners."; return 1; }
+    HY2_NAT4=$(iptables -t nat -S 2>/dev/null) ||
+        { err "Could not inspect IPv4 NAT."; return 1; }
+    HY2_NAT6=$(ip6tables -t nat -S 2>/dev/null) ||
+        { err "Could not inspect IPv6 NAT."; return 1; }
+    HY2_NFT=$(nft list ruleset 2>/dev/null) ||
+        { err "Could not inspect native nftables rules."; return 1; }
+}
+
+# Fail closed on unknown listeners, even when they bind only one address family.
+# Never take over HY1's NAT pool, or an inactive but configured SlowDNS :53.
+hy2_check_port() {
+    local p="$1" hop="$2" line n
+    hy2_port_valid "$p" || { err "Invalid port or reserved HY1/hopping range."; return 1; }
+    if [ "$p" = 53 ] && ! hy2_slow_configured && [ -f /etc/systemd/system/slowdns.service ]; then
+        err "SlowDNS unit is unknown; refusing UDP 53."; return 1
+    fi
+    if [ "$p" = 53 ] && hy2_slow_configured && [ -f "$HY2_SLOW" ]; then
+        err "SlowDNS handover is already pending; deactivate Hysteria 2 first."; return 1
+    fi
+    hy2_snapshot || return 1
+    # No port can already be intercepted by somebody else's NAT rules.
+    if hy2_nat_conflict "$p" "$p" || hy2_nft_conflict "$p" "$p"; then
+        err "UDP $p conflicts with an IPv4/IPv6 NAT or nftables UDP rule."; return 1
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$(awk '{print $4}' <<< "$line" | sed -nE 's/.*:([0-9]+)$/\1/p')
+        [ -n "$n" ] || { err "Cannot inspect a UDP listener."; return 1; }
+        if [ "$n" = "$p" ] || { [ "$hop" = 1 ] && (( n >= 51000 && n <= 51999 )); }; then
+            if [ "$p" = 53 ] && [ "$n" = 53 ] && hy2_slow_configured &&
+                [[ "$line" == *'dnstt-server'* ]]; then continue; fi
+            err "UDP $n has a listener; refusing takeover."; return 1
+        fi
+    done <<< "$HY2_SS"
+    if [ "$hop" = 1 ]; then
+        # Reject any NAT entry touching the hop range, not just this panel's rules.
+        if hy2_nat_conflict 51000 51999 || hy2_nft_conflict 51000 51999; then
+            err "UDP hopping range overlaps an IPv4/IPv6 NAT or nftables rule."; return 1
+        fi
+    fi
+    return 0
+}
+
+hy2_write_support() {
+    mkdir -p "$HY2_DIR" || return 1
+    chmod 700 "$HY2_DIR"
+    # Command auth takes positional addr, auth, tx; success is exit 0 and
+    # stdout is the unique identity. Check expiry on EVERY connection.
+    cat > "$HY2_DIR/auth" <<'HY2AUTHEOF'
+#!/bin/bash
+umask 077
+[[ "$2" =~ ^[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_.@!+-]{8,128}$ ]] || exit 1
+user=${2%%:*}; password=${2#*:}
+today=$(date -u +%Y%m%d)
+awk -F '\t' -v user="$user" -v password="$password" -v today="$today" \
+    '$1==user && $2==password && length($3)==8 && $3 ~ /^[0-9]+$/ && $3>=today {found=1} END {exit !found}' \
+    /etc/hysteria2/accounts || exit 1
+printf '%s\n' "$user"
+HY2AUTHEOF
+    chmod 700 "$HY2_DIR/auth"
+    cat > "$HY2_HOP" <<'HY2FWEOF'
+#!/bin/bash
+export PATH="/usr/sbin:/sbin:/usr/local/sbin:$PATH"
+set -e
+DIR=/etc/hysteria2
+read -r PORT < "$DIR/port"
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || exit 1
+HOP=$(cat "$DIR/hop")
+[[ "$HOP" = 0 || "$HOP" = 1 ]] || exit 1
+base=(-p udp --dport "$PORT" -m comment --comment HYSTERIA2-OWNED -j ACCEPT)
+range=(-p udp --dport 51000:51999 -m comment --comment HYSTERIA2-OWNED -j ACCEPT)
+if [ "$HOP" = 1 ]; then
+    read -r IFACE < "$DIR/iface"
+    [[ "$IFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || exit 1
+    nat=(-i "$IFACE" -p udp --dport 51000:51999 -m comment --comment HYSTERIA2-OWNED -j REDIRECT --to-ports "$PORT")
+fi
+overlaps() {
+    local lo=$1 hi=$2 rule=$3 spec part first last
+    [[ "$rule" == *HYSTERIA2-OWNED* ]] && return 1
+    if [[ "$rule" == *' -p udp '* || "$rule" == *' -p 17 '* ]] &&
+        [[ "$rule" =~ --dports?[[:space:]]+([^[:space:]]+) ]]; then
+        spec=${BASH_REMATCH[1]}
+    elif [[ "$rule" =~ (dnat|redirect|tproxy) ]] &&
+        [[ "$rule" =~ (udp|th)[[:space:]]+dport[[:space:]]+(\{[^}]*\}|[^[:space:]]+) ]]; then
+        spec=${BASH_REMATCH[2]}
+        spec=$(printf '%s' "$spec" | tr -d '[:space:]{}')
+    else
+        return 1
+    fi
+    while IFS= read -r part; do
+        part=${part//:/-}
+        first=${part%%-*}; last=${part##*-}
+        [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || return 0
+        (( first > hi || last < lo )) || return 0
+    done < <(printf '%s\n' "$spec" | tr ',' '\n')
+    return 1
+}
+if [ "$1" = up ]; then
+    # Re-check at every systemd start, including reboot, before installing
+    # any rule. An outside service could have claimed these UDP ports since
+    # the interactive allocation.
+    command -v ss >/dev/null && command -v ip6tables >/dev/null &&
+        command -v nft >/dev/null || { echo "Hysteria 2: missing firewall inspection tools" >&2; exit 1; }
+    listeners=$(ss -H -lun 2>/dev/null) || exit 1
+    rules4=$(iptables -t nat -S 2>/dev/null) || exit 1
+    rules6=$(ip6tables -t nat -S 2>/dev/null) || exit 1
+    rulesn=$(nft list ruleset 2>/dev/null) || exit 1
+    while IFS= read -r listener; do
+        [ -n "$listener" ] || continue
+        n=${listener##*:}
+        [[ "$n" =~ ^[0-9]+$ ]] || { echo "Hysteria 2: unknown UDP listener" >&2; exit 1; }
+        if (( n == PORT )) || { [ "$HOP" = 1 ] && (( n >= 51000 && n <= 51999 )); }; then
+            echo "Hysteria 2: UDP $n occupied" >&2; exit 1
+        fi
+    done < <(printf '%s\n' "$listeners" | awk '{print $4}')
+    while IFS= read -r rule; do
+        if overlaps "$PORT" "$PORT" "$rule" ||
+            { [ "$HOP" = 1 ] && overlaps 51000 51999 "$rule"; }; then
+            echo "Hysteria 2: UDP port intercepted by firewall/NAT" >&2; exit 1
+        fi
+    done <<< "$rules4"$'\n'"$rules6"$'\n'"$rulesn"
+    iptables -C INPUT "${base[@]}" 2>/dev/null || iptables -I INPUT 1 "${base[@]}"
+    if [ "$HOP" = 1 ]; then
+        iptables -C INPUT "${range[@]}" 2>/dev/null || iptables -I INPUT 1 "${range[@]}"
+        iptables -t nat -C PREROUTING "${nat[@]}" 2>/dev/null || iptables -t nat -A PREROUTING "${nat[@]}"
+    fi
+elif [ "$1" = down ]; then
+    [ "$HOP" = 1 ] && { iptables -t nat -D PREROUTING "${nat[@]}" 2>/dev/null || :; }
+    iptables -D INPUT "${range[@]}" 2>/dev/null || :
+    iptables -D INPUT "${base[@]}" 2>/dev/null || :
+else
+    exit 1
+fi
+HY2FWEOF
+    chmod 700 "$HY2_HOP"
+    cat > "$HY2_UNIT" <<'HY2UNITEOF'
+[Unit]
+Description=Hysteria 2 UDP server (independent of Hysteria 1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/hysteria2-firewall up
+ExecStart=/usr/local/bin/hysteria2 server -c /etc/hysteria2/config.yaml
+ExecStopPost=/usr/local/bin/hysteria2-firewall down
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+HY2UNITEOF
+    systemctl daemon-reload
+}
+
+hy2_restore_slow() {
+    [ -f "$HY2_SLOW" ] || return 0
+    local active enabled
+    read -r active enabled < "$HY2_SLOW"
+    if [ "$enabled" = 1 ]; then systemctl enable slowdns.service >/dev/null 2>&1 ||
+        { err "Could not re-enable SlowDNS; handover state retained."; return 1; }
+    fi
+    if [ "$active" = 1 ]; then
+        systemctl start slowdns.service >/dev/null 2>&1 &&
+            systemctl is-active --quiet slowdns.service ||
+            { err "Could not restart SlowDNS; handover state retained."; return 1; }
+    fi
+    rm -f "$HY2_SLOW"
+}
+
+hy2_activate() {
+    local port hop active=0 enabled=0 cert_host iface pre53 post53
+    section "ACTIVATE HYSTERIA 2" "$SKY"
+    if systemctl is-active --quiet hysteria2.service; then
+        err "Already active. Deactivate before changing ports."; pause; return
+    fi
+    if [ -f "$HY2_SLOW" ]; then
+        err "Unrestored SlowDNS handover. Deactivate/restore first."; pause; return
+    fi
+    read -rp "  UDP port (443 / 53 / custom): " port
+    read -rp "  Hop over UDP 51000-51999? (y/N): " hop
+    [ "$hop" = y ] && hop=1 || hop=0
+    # Canonicalize before comparing against SlowDNS's reserved port.
+    hy2_port_valid "$port" || { err "Invalid or reserved UDP port."; pause; return; }
+    port=$((10#$port))
+    if ! hy2_prepare_tools; then pause; return; fi
+    if ! hy2_check_port "$port" "$hop"; then pause; return; fi
+    if [ "$port" = 53 ] && hy2_slow_configured; then
+        read -rp "  Stop only SlowDNS and transfer UDP 53 (restore on deactivate)? type YES: " answer
+        [ "$answer" = YES ] || { note "Cancelled; SlowDNS untouched."; pause; return; }
+        # Refuse if ANY unrelated UDP 53 listener exists.
+        pre53=$(ss -H -lunp 2>/dev/null) ||
+            { err "Could not recheck UDP 53 listeners; SlowDNS untouched."; pause; return; }
+        if printf '%s\n' "$pre53" | grep -E ':[5]3[[:space:]]' | grep -qv 'dnstt-server'; then
+            err "UDP 53 also belongs to another process (dnsmasq/resolved); refusing."; pause; return
+        fi
+    fi
+    if [ "$hop" = 1 ] && { ! command -v ip >/dev/null || ! ip -o -4 route show default | grep -q ' dev '; }; then
+        err "Hopping requires a default IPv4 interface."; pause; return
+    fi
+    if [ "$hop" = 1 ]; then
+        iface=$(ip -o -4 route show default | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+        [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] ||
+            { err "Unsafe hopping interface."; pause; return; }
+    fi
+    hy2_install || { pause; return; }
+    hy2_write_support || { err "Could not write HY2 support files."; pause; return; }
+    if [ ! -s "$HY2_DIR/server.crt" ] || [ ! -s "$HY2_DIR/server.key" ]; then
+        cert_host=${HOST_DISPLAY:-localhost}
+        [[ "$cert_host" =~ ^[a-zA-Z0-9.:-]+$ ]] || cert_host=localhost
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -subj "/CN=$cert_host" -keyout "$HY2_DIR/server.key" \
+            -out "$HY2_DIR/server.crt" >/dev/null 2>&1 ||
+            { err "Certificate creation failed."; pause; return; }
+        chmod 600 "$HY2_DIR/server.key"
+    fi
+    # Write to temporary files first. No HY1/SlowDNS changes until all inputs pass.
+    printf '%s\n' "$port" > "$HY2_PORT_FILE.new"
+    printf '%s\n' "$hop" > "$HY2_DIR/hop.new"
+    printf '%s\n' "${iface:-none}" > "$HY2_DIR/iface.new"
+    cat > "$HY2_DIR/config.yaml.new" <<HY2CONFIGEOF
+listen: :$port
+tls:
+  cert: $HY2_DIR/server.crt
+  key: $HY2_DIR/server.key
+auth:
+  type: command
+  command: $HY2_DIR/auth
+HY2CONFIGEOF
+    [ -f "$HY2_USERS" ] || : > "$HY2_USERS"
+    chmod 600 "$HY2_USERS"
+    if [ "$port" = 53 ] && hy2_slow_configured; then
+        systemctl is-active --quiet slowdns.service && active=1
+        systemctl is-enabled --quiet slowdns.service && enabled=1
+        printf '%s %s\n' "$active" "$enabled" > "$HY2_SLOW"
+        if ! systemctl disable --now slowdns.service >/dev/null 2>&1; then
+            hy2_restore_slow; rm -f "$HY2_PORT_FILE.new" "$HY2_DIR/hop.new" "$HY2_DIR/iface.new" "$HY2_DIR/config.yaml.new"
+            err "Could not release SlowDNS UDP 53."; pause; return
+        fi
+        # SlowDNS may have been inactive while another process claimed :53.
+        post53=$(ss -H -lun 2>/dev/null)
+        if [ "$?" -ne 0 ] || printf '%s\n' "$post53" | grep -Eq ':[5]3[[:space:]]'; then
+            hy2_restore_slow; rm -f "$HY2_PORT_FILE.new" "$HY2_DIR/hop.new" "$HY2_DIR/iface.new" "$HY2_DIR/config.yaml.new"
+            err "Could not verify UDP 53 is free; restored SlowDNS."; pause; return
+        fi
+    fi
+    mv "$HY2_PORT_FILE.new" "$HY2_PORT_FILE"
+    mv "$HY2_DIR/hop.new" "$HY2_DIR/hop"
+    mv "$HY2_DIR/iface.new" "$HY2_DIR/iface"
+    mv "$HY2_DIR/config.yaml.new" "$HY2_DIR/config.yaml"
+    chmod 600 "$HY2_DIR/config.yaml" "$HY2_PORT_FILE" "$HY2_DIR/hop" "$HY2_DIR/iface"
+    if ! systemctl enable --now hysteria2.service >/dev/null 2>&1 ||
+        { sleep 2; ! systemctl is-active --quiet hysteria2.service; }; then
+        systemctl disable --now hysteria2.service >/dev/null 2>&1 || :
+        "$HY2_HOP" down 2>/dev/null || :
+        rm -f "$HY2_PORT_FILE" "$HY2_DIR/hop" "$HY2_DIR/iface" "$HY2_DIR/config.yaml"
+        hy2_restore_slow || :
+        err "Hysteria 2 failed to start; port/config reverted. Check journalctl -u hysteria2."
+    else
+        ok "Hysteria 2 active on UDP $port (hop: $hop). Self-signed TLS: clients must set insecure=1."
+    fi
+    pause
+}
+
+hy2_link() {
+    local user="$1" pass="$2" port="$3" host="${HOST_DISPLAY:-$SERVER_IP}" encoded
+    [ -n "$host" ] || { err "No host/IP configured."; return 1; }
+    [[ "$host" == *:* ]] && host="[$host]"
+    # RFC 3986 userinfo must be percent-encoded (notably @, + and !).
+    # The receiver decodes the userpass auth value before command authentication.
+    encoded=${pass//@/%40}
+    encoded=${encoded//+/%2B}
+    encoded=${encoded//!/%21}
+    printf '  Standard: hysteria2://%s:%s@%s:%s/?insecure=1#%s\n' \
+        "$user" "$encoded" "$host" "$port" "$user"
+    if [ "$(cat "$HY2_DIR/hop" 2>/dev/null)" = 1 ]; then
+        printf '  Hopping:  hysteria2://%s:%s@%s:%s,51000-51999/?insecure=1#%s\n' \
+            "$user" "$encoded" "$host" "$port" "$user"
+    fi
+}
+
+hy2_add() {
+    local u p days expiry port
+    [ -f "$HY2_PORT_FILE" ] && systemctl is-active --quiet hysteria2.service ||
+        { err "Activate Hysteria 2 first."; pause; return; }
+    read -rp "  Username (letters/digits/_/-): " u
+    [[ "$u" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || { err "Invalid username."; pause; return; }
+    if awk -F '\t' -v u="$u" '$1==u{found=1} END{exit !found}' "$HY2_USERS"; then
+        err "Username already exists."; pause; return
+    fi
+    read -rp "  Password (8+ letters/digits/_.@!+-): " p
+    [[ "$p" =~ ^[a-zA-Z0-9_.@!+-]{8,128}$ ]] || { err "Invalid password."; pause; return; }
+    read -rp "  Days valid (1-3650): " days
+    [[ "$days" =~ ^[0-9]{1,4}$ ]] && (( 10#$days >= 1 && 10#$days <= 3650 )) ||
+        { err "Invalid expiry."; pause; return; }
+    expiry=$(date -u -d "+$((10#$days)) days" +%Y%m%d) || { err "Invalid date."; pause; return; }
+    printf '%s\t%s\t%s\n' "$u" "$p" "$expiry" >> "$HY2_USERS" ||
+        { err "Could not save account."; pause; return; }
+    port=$(cat "$HY2_PORT_FILE")
+    ok "Account created; valid through UTC $expiry. Share private links securely."
+    note "Expiry and deletion deny NEW connections; existing sessions remain until disconnect."
+    hy2_link "$u" "$p" "$port"
+    pause
+}
+
+hy2_list() {
+    local u p exp port
+    [ -s "$HY2_USERS" ] || { note "No Hysteria 2 accounts."; return; }
+    note "Dates are valid-through UTC; expiry/deletion deny NEW connections only."
+    note "Already-connected sessions may continue until they disconnect."
+    port=$(cat "$HY2_PORT_FILE" 2>/dev/null)
+    while IFS=$'\t' read -r u p exp; do
+        [ -n "$u" ] || continue
+        if [[ "$exp" < "$(date -u +%Y%m%d)" ]]; then
+            echo "  $u — EXPIRED ($exp)"
+        else
+            echo "  $u — valid through UTC $exp"
+        fi
+        [ -n "$port" ] && hy2_link "$u" "$p" "$port"
+    done < "$HY2_USERS"
+}
+
+hy2_delete() {
+    local u tmp
+    [ -s "$HY2_USERS" ] || { err "No accounts."; pause; return; }
+    read -rp "  Username to remove: " u
+    [[ "$u" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] ||
+        { err "Invalid username."; pause; return; }
+    if ! awk -F '\t' -v u="$u" '$1==u{found=1} END{exit !found}' "$HY2_USERS"; then
+        err "Account not found."; pause; return
+    fi
+    tmp=$(mktemp "$HY2_DIR/accounts.XXXXXX") || return
+    if awk -F '\t' -v u="$u" '$1!=u' "$HY2_USERS" > "$tmp"; then
+        chmod 600 "$tmp"; mv "$tmp" "$HY2_USERS"; ok "Account revoked for new connections."
+    else rm -f "$tmp"; err "Could not revoke account."; fi
+    pause
+}
+
+hy2_deactivate() {
+    if [ -f "$HY2_PORT_FILE" ]; then
+        systemctl disable --now hysteria2.service >/dev/null 2>&1 || :
+        if systemctl is-active --quiet hysteria2.service; then
+            err "Hysteria 2 did not stop; SlowDNS not restored while port remains bound."
+            pause; return
+        fi
+        "$HY2_HOP" down 2>/dev/null || :
+        rm -f "$HY2_PORT_FILE" "$HY2_DIR/hop" "$HY2_DIR/iface" "$HY2_DIR/config.yaml"
+    fi
+    hy2_restore_slow || { pause; return; }
+    ok "Hysteria 2 deactivated; accounts retained and SlowDNS restored."
+    pause
+}
+
+hy2_menu() {
+    local choice
+    while true; do
+        section "HYSTERIA 2 (UDP, separate from HYSTERIA 1)" "$SKY"
+        if systemctl is-active --quiet hysteria2.service; then
+            echo "  Active on UDP $(cat "$HY2_PORT_FILE" 2>/dev/null)"
+        else echo "  Inactive"; fi
+        echo "  Expiry/deletion blocks new connections, not existing QUIC sessions."
+        menu_item "1" "⚡" "Activate / choose UDP port" "$G"
+        menu_item "2" "➕" "Add account" "$LIME"
+        menu_item "3" "📋" "List accounts and links" "$SKY"
+        menu_item "4" "🗑 " "Delete account" "$ORANGE"
+        menu_item "5" "🧹" "Deactivate / restore SlowDNS" "$R"
+        menu_item "0" "↩ " "Back" "$GR"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1) hy2_activate ;; 2) hy2_add ;; 3) hy2_list; pause ;;
+            4) hy2_delete ;; 5) hy2_deactivate ;; 0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
 menu_item() {  # menu_item NUM ICON "Label" color
     echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
 }
@@ -3343,6 +3864,7 @@ while true; do
     menu_item "12" "🛡 " "Abuse protection"        "$LIME"
     menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
+    menu_item "15" "⚡" "Hysteria 2 (UDP)"          "$LIME"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -3361,6 +3883,7 @@ while true; do
         12) abuse_menu ;;
         13) hysteria_menu ;;
         14) fastdns_menu ;;
+        15) hy2_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
