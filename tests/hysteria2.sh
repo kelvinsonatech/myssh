@@ -8,7 +8,7 @@ sed -n '/^# Hysteria 2 is deliberately isolated/,/^menu_item() {/p' scripts/ssh-
     sed '$d' > "$tmp/functions"
 # Extract functions only, then override their paths/mocks in this shell.
 source "$tmp/functions"
-SKY=; HOST_DISPLAY=localhost
+SKY=; SERVER_IP=192.0.2.10; DOMAIN=example.net
 HY2_DIR="$tmp/etc/hysteria2"
 HY2_PORT_FILE="$HY2_DIR/port"
 HY2_USERS="$HY2_DIR/accounts"
@@ -26,6 +26,7 @@ note() { :; }
 ok() { :; }
 err() { echo "ERROR: $*" >&2; }
 hy2_install() { return 0; }
+# Activation tests must not write system service/firewall files.
 hy2_write_support() { return 0; }
 hy2_slow_configured() { return 0; }
 state="$tmp/state"
@@ -138,21 +139,53 @@ SS_UNKNOWN=1 hy2_activate <<< $'53\nn\nYES' >/dev/null 2>&1 || :
 hy2_activate <<< $'443\nn' >/dev/null 2>&1 || :
 [ "$(cat "$state")" = '1 1' ]
 [ ! -e "$HY2_PORT_FILE" ]
-# The standard and multi-port variants must both encode URI userinfo.
+# The standard and multi-port variants use an IP endpoint and configured SNI.
+printf 'alice\tstrong@pass+!\t29991231\n' > "$HY2_USERS"
 printf '1\n' > "$HY2_DIR/hop"
 links=$(hy2_link alice 'strong@pass+!' 443)
-[[ "$links" == *'Standard: hysteria2://alice:strong%40pass%2B%21@localhost:443/?insecure=1#alice'* ]]
-[[ "$links" == *'Hopping:  hysteria2://alice:strong%40pass%2B%21@localhost:443,51000-51999/?insecure=1#alice'* ]]
+[[ "$links" == *'Standard: hy2://strong%40pass%2B%21@192.0.2.10:443?insecure=1&sni=example.net#alice'* ]]
+[[ "$links" == *'Hopping:  hy2://strong%40pass%2B%21@192.0.2.10:443,51000-51999?insecure=1&sni=example.net#alice'* ]]
 printf '0\n' > "$HY2_DIR/hop"
 [[ $(hy2_link alice 'strong@pass+!' 443) != *'Hopping:'* ]]
-# Verify the exact generated command-auth script with its accounts path
-# redirected to the temporary fixture (no production files are written).
-sed -n '/^    cat > "\$HY2_DIR\/auth" <<'\''HY2AUTHEOF'\''/,/^HY2AUTHEOF$/p' \
-    scripts/ssh-ssl-setup.sh | sed '1d;$d' |
-    sed "s@/etc/hysteria2/accounts@$HY2_USERS@" > "$tmp/auth"
+SERVER_IP=2001:db8::10
+[[ $(hy2_link alice 'strong@pass+!' 443) == *'hy2://strong%40pass%2B%21@[2001:db8::10]:443?insecure=1&sni=example.net#alice'* ]]
+DOMAIN=
+[[ $(hy2_link alice 'strong@pass+!' 443) == *'@[2001:db8::10]:443?insecure=1#alice'* ]]
+[[ $(hy2_link alice 'strong@pass+!' 443) != *'&sni='* ]]
+SERVER_IP=192.0.2.10
+DOMAIN=example.net
+printf 'expired\tstrong@pass+!\t20000101\n' >> "$HY2_USERS"
+note() { echo "$*"; }
+links=$(hy2_link alice 'strong@pass+!' 443)
+[[ "$links" == *'Warning: password shared'* ]]
+[[ "$links" == *'hy2://alice:strong%40pass%2B%21@192.0.2.10:443?insecure=1&sni=example.net#alice'* ]]
+# An existing active service can update only the auth helper, atomically,
+# without touching firewall/service configuration or restarting.
+printf 'sentinel\n' > "$HY2_DIR/config.yaml"
+printf 'sentinel\n' > "$HY2_HOP"
+old_inode=$(stat -c %i "$HY2_DIR/auth")
+hy2_write_auth
+[ "$(cat "$HY2_DIR/config.yaml")" = sentinel ]
+[ "$(cat "$HY2_HOP")" = sentinel ]
+[ "$(stat -c %i "$HY2_DIR/auth")" != "$old_inode" ]
+[ "$(stat -c %a "$HY2_DIR/auth")" = 700 ]
+# Verify the generated helper against the fixture without touching /etc.
+sed "s@/etc/hysteria2/accounts@$HY2_USERS@" "$HY2_DIR/auth" > "$tmp/auth"
 chmod +x "$tmp/auth"
-printf 'alice\tstrongpass123\t29991231\nexpired\tstrongpass123\t20000101\n' > "$HY2_USERS"
-[ "$("$tmp/auth" 127.0.0.1 alice:strongpass123 0)" = alice ]
-if "$tmp/auth" 127.0.0.1 expired:strongpass123 0 >/dev/null; then exit 1; fi
-if "$tmp/auth" 127.0.0.1 alice:badpassword 0 >/dev/null; then exit 1; fi
-echo 'Hysteria 2 guards and handover rollback: OK'
+assert_reject "$tmp/auth" 127.0.0.1 'strong@pass+!' 0
+[ "$("$tmp/auth" 127.0.0.1 'alice:strong@pass+!' 0)" = alice ]
+assert_reject "$tmp/auth" 127.0.0.1 'expired:strong@pass+!' 0
+printf 'alice\tstrong@pass+!\t29991231\nexpired\totherpass123\t20000101\n' > "$HY2_USERS"
+[ "$("$tmp/auth" 127.0.0.1 'strong@pass+!' 0)" = alice ]
+assert_reject "$tmp/auth" 127.0.0.1 otherpass123 0
+assert_reject "$tmp/auth" 127.0.0.1 'expired:otherpass123' 0
+assert_reject "$tmp/auth" 127.0.0.1 wrongpass123 0
+# Reject reuse even when the other account has expired.
+printf '443\n' > "$HY2_PORT_FILE"
+(
+    systemctl() { return 0; }
+    output=$(hy2_add <<< $'newuser\notherpass123\n30' 2>&1)
+    [[ "$output" == *'Password already belongs to an account'* ]]
+    [ "$(wc -l < "$HY2_USERS")" = 2 ]
+)
+echo 'Hysteria 2 guards, links, auth and handover rollback: OK'

@@ -3509,23 +3509,47 @@ hy2_check_port() {
     return 0
 }
 
+hy2_write_auth() {
+    mkdir -p "$HY2_DIR" || return 1
+    local tmp
+    tmp=$(mktemp "$HY2_DIR/auth.XXXXXX") || return 1
+    # Command auth takes positional addr, auth, tx; success is exit 0 and
+    # stdout is the unique identity. Check expiry on EVERY connection.
+    # Password-only auth must be unique across ALL accounts, even expired ones.
+    # Keep user:password auth for accounts created before password-only links.
+    if ! cat > "$tmp" <<'HY2AUTHEOF'
+#!/bin/bash
+umask 077
+if [[ "$2" =~ ^[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_.@!+-]{8,128}$ ]]; then
+    user=${2%%:*}; password=${2#*:}
+    legacy=1
+elif [[ "$2" =~ ^[a-zA-Z0-9_.@!+-]{8,128}$ ]]; then
+    password=$2
+    legacy=0
+else
+    exit 1
+fi
+today=$(date -u +%Y%m%d)
+awk -F '\t' -v user="$user" -v password="$password" -v legacy="$legacy" -v today="$today" '
+    $2==password && (!legacy || $1==user) {
+        matches++
+        identity=$1
+        valid=(length($3)==8 && $3 ~ /^[0-9]+$/ && $3>=today)
+    }
+    END {
+        if (matches!=1 || !valid) exit 1
+        print identity
+    }' /etc/hysteria2/accounts
+HY2AUTHEOF
+    then rm -f "$tmp"; return 1; fi
+    chmod 700 "$tmp" && mv -f "$tmp" "$HY2_DIR/auth" ||
+        { rm -f "$tmp"; return 1; }
+}
+
 hy2_write_support() {
     mkdir -p "$HY2_DIR" || return 1
     chmod 700 "$HY2_DIR"
-    # Command auth takes positional addr, auth, tx; success is exit 0 and
-    # stdout is the unique identity. Check expiry on EVERY connection.
-    cat > "$HY2_DIR/auth" <<'HY2AUTHEOF'
-#!/bin/bash
-umask 077
-[[ "$2" =~ ^[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_.@!+-]{8,128}$ ]] || exit 1
-user=${2%%:*}; password=${2#*:}
-today=$(date -u +%Y%m%d)
-awk -F '\t' -v user="$user" -v password="$password" -v today="$today" \
-    '$1==user && $2==password && length($3)==8 && $3 ~ /^[0-9]+$/ && $3>=today {found=1} END {exit !found}' \
-    /etc/hysteria2/accounts || exit 1
-printf '%s\n' "$user"
-HY2AUTHEOF
-    chmod 700 "$HY2_DIR/auth"
+    hy2_write_auth || return 1
     cat > "$HY2_HOP" <<'HY2FWEOF'
 #!/bin/bash
 export PATH="/usr/sbin:/sbin:/usr/local/sbin:$PATH"
@@ -3731,19 +3755,30 @@ HY2CONFIGEOF
 }
 
 hy2_link() {
-    local user="$1" pass="$2" port="$3" host="${HOST_DISPLAY:-$SERVER_IP}" encoded
-    [ -n "$host" ] || { err "No host/IP configured."; return 1; }
+    local user="$1" pass="$2" port="$3" host="${SERVER_IP:-}" encoded auth query
+    [ -n "$host" ] || { err "No server IP configured."; return 1; }
+    [[ "$host" =~ ^[0-9a-fA-F:.]+$ ]] ||
+        { err "Invalid server IP for Hysteria 2 link."; return 1; }
+    [[ -z "${DOMAIN:-}" || "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] ||
+        { err "Invalid configured SNI domain."; return 1; }
+    hy2_write_auth || { err "Could not update Hysteria 2 auth helper; no links emitted."; return 1; }
     [[ "$host" == *:* ]] && host="[$host]"
     # RFC 3986 userinfo must be percent-encoded (notably @, + and !).
-    # The receiver decodes the userpass auth value before command authentication.
     encoded=${pass//@/%40}
     encoded=${encoded//+/%2B}
     encoded=${encoded//!/%21}
-    printf '  Standard: hysteria2://%s:%s@%s:%s/?insecure=1#%s\n' \
-        "$user" "$encoded" "$host" "$port" "$user"
+    auth=$encoded
+    if ! awk -F '\t' -v p="$pass" '$2==p{n++} END{exit !(n==1)}' "$HY2_USERS"; then
+        note "Warning: password shared by multiple accounts (including expired); using legacy user:password links for $user."
+        auth="$user:$encoded"
+    fi
+    query='insecure=1'
+    [ -z "${DOMAIN:-}" ] || query="$query&sni=$DOMAIN"
+    printf '  Standard: hy2://%s@%s:%s?%s#%s\n' \
+        "$auth" "$host" "$port" "$query" "$user"
     if [ "$(cat "$HY2_DIR/hop" 2>/dev/null)" = 1 ]; then
-        printf '  Hopping:  hysteria2://%s:%s@%s:%s,51000-51999/?insecure=1#%s\n' \
-            "$user" "$encoded" "$host" "$port" "$user"
+        printf '  Hopping:  hy2://%s@%s:%s,51000-51999?%s#%s\n' \
+            "$auth" "$host" "$port" "$query" "$user"
     fi
 }
 
@@ -3758,6 +3793,10 @@ hy2_add() {
     fi
     read -rp "  Password (8+ letters/digits/_.@!+-): " p
     [[ "$p" =~ ^[a-zA-Z0-9_.@!+-]{8,128}$ ]] || { err "Invalid password."; pause; return; }
+    if awk -F '\t' -v p="$p" '$2==p{found=1} END{exit !found}' "$HY2_USERS"; then
+        err "Password already belongs to an account (including expired); choose a unique password."
+        pause; return
+    fi
     read -rp "  Days valid (1-3650): " days
     [[ "$days" =~ ^[0-9]{1,4}$ ]] && (( 10#$days >= 1 && 10#$days <= 3650 )) ||
         { err "Invalid expiry."; pause; return; }

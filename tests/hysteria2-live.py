@@ -26,7 +26,7 @@ processes = []
 with tempfile.TemporaryDirectory(prefix="hy2-live-") as directory:
     root = pathlib.Path(directory)
     accounts = root / "accounts"
-    accounts.write_text("demo\tTestPass123\t20990101\nexpired\tTestPass123\t20000101\n")
+    accounts.write_text("demo\tTestPass123\t20990101\nexpired\tExpiredPass123\t20000101\n")
     helper = root / "auth"
     helper.write_text(auth.replace("/etc/hysteria2/accounts", str(accounts)))
     helper.chmod(0o700)
@@ -57,9 +57,18 @@ with tempfile.TemporaryDirectory(prefix="hy2-live-") as directory:
         processes.append(server)
         time.sleep(0.5)
         assert server.poll() is None, (root / "server.log").read_text()
-        for credential, expected in [("demo:TestPass123", True),
-                                     ("demo:WrongPass123", False),
-                                     ("expired:TestPass123", False)]:
+        for credential, expected, duplicate in [
+            ("TestPass123", True, False),
+            ("demo:TestPass123", True, False),
+            ("WrongPass123", False, False),
+            ("ExpiredPass123", False, False),
+            ("expired:ExpiredPass123", False, False),
+            ("TestPass123", False, True),
+            ("demo:TestPass123", True, True),
+        ]:
+            if duplicate:
+                accounts.write_text("demo\tTestPass123\t20990101\n"
+                                    "expired\tTestPass123\t20000101\n")
             socks = port()
             client_config = {"server": f"127.0.0.1:{udp}", "auth": credential,
                              "tls": {"insecure": True},
@@ -87,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix="hy2-live-") as directory:
                 assert "auth" in (root / "client.log").read_text().lower()
             client.terminate()
             client.wait(timeout=5)
-        print("PASS: real QUIC transfer, incorrect password rejection, expired-account rejection")
+        print("PASS: real QUIC password-only and legacy transfers, wrong/expired/duplicate rejection")
     finally:
         for process in processes:
             if process.poll() is None:

@@ -20,3 +20,14 @@ restart operations must also respect persistent handover ownership.
 **How to apply:** keep account-auth testing separate from firewall/systemd
 validation. A passing localhost QUIC transfer does not establish VPS firewall,
 provider filtering, reboot, or real-client compatibility.
+
+Prefer password-only HY2 share links with the server IP and explicit configured
+domain SNI, while retaining legacy username:password authentication.
+
+**Why:** the user reported mobile import failure with the earlier links and
+supplied a working password-only example. Local upstream client success alone
+does not prove mobile importer compatibility. Password-only authentication must
+fail closed when multiple accounts share a password, including expired accounts.
+
+**How to apply:** do not copy sample credentials or domains, change HY1's
+reserved hopping range, or restart other users' sessions to update link format.
