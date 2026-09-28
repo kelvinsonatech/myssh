@@ -83,6 +83,23 @@ nft() {
 assert_reject() {
     if "$@" >/dev/null 2>&1; then echo "Expected rejection: $*" >&2; exit 1; fi
 }
+# Dependency preparation never installs without approval and does not bypass
+# verification after apt failure or an incomplete installation.
+(
+    installed=0
+    hy2_missing_tools() { [ "$installed" = 1 ] || echo nft; }
+    apt-get() { installed=1; }
+    assert_reject hy2_prepare_tools <<< n
+    [ "$installed" = 0 ]
+    hy2_prepare_tools <<< y
+    [ "$installed" = 1 ]
+    installed=0
+    apt-get() { return 1; }
+    assert_reject hy2_prepare_tools <<< y
+    apt-get() { return 0; }
+    assert_reject hy2_prepare_tools <<< y
+)
+hy2_prepare_tools
 assert_reject hy2_check_port 36712 0
 assert_reject hy2_check_port 20000 0
 assert_reject hy2_check_port 50000 0

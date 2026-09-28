@@ -3426,10 +3426,44 @@ hy2_nft_conflict() {
 
 # Exit on inspection errors instead of interpreting failed commands as empty
 # rulesets. Check IPv6 NAT even if the chosen interface is IPv4.
+hy2_missing_tools() {
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local tool
+    for tool in ss iptables ip6tables nft; do
+        command -v "$tool" >/dev/null 2>&1 || printf '%s\n' "$tool"
+    done
+}
+
+hy2_prepare_tools() {
+    local missing answer
+    missing=$(hy2_missing_tools)
+    # Command substitution runs in a subshell; fix this shell's PATH too.
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    [ -n "$missing" ] || return 0
+    note "Missing network inspection tools: ${missing//$'\n'/, }"
+    command -v apt-get >/dev/null 2>&1 ||
+        { err "Install iproute2, iptables and nftables, then retry. No service was stopped."; return 1; }
+    read -rp "  Install missing inspection tools now? (y/N): " answer
+    [[ "$answer" = y || "$answer" = Y ]] ||
+        { err "Activation cancelled; no service was stopped."; return 1; }
+    # Install tooling only: never enable nftables, flush rules, change
+    # iptables alternatives, or upgrade/restart existing tunnel packages.
+    if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-install-recommends iproute2 iptables nftables; then
+        err "Tool installation failed. Check apt output above; no tunnel handover was attempted."
+        return 1
+    fi
+    missing=$(hy2_missing_tools)
+    [ -z "$missing" ] ||
+        { err "Still missing: ${missing//$'\n'/, }. Activation stopped."; return 1; }
+}
+
 hy2_snapshot() {
-    command -v ss >/dev/null && command -v iptables >/dev/null &&
-        command -v ip6tables >/dev/null && command -v nft >/dev/null ||
-        { err "ss, iptables, ip6tables and nft required for safe UDP allocation."; return 1; }
+    local missing
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    missing=$(hy2_missing_tools)
+    [ -z "$missing" ] ||
+        { err "Missing tools: ${missing//$'\n'/, }. Install iproute2 iptables nftables, then retry."; return 1; }
     HY2_SS=$(ss -H -lunp 2>/dev/null) ||
         { err "Could not inspect UDP listeners."; return 1; }
     HY2_NAT4=$(iptables -t nat -S 2>/dev/null) ||
@@ -3617,6 +3651,7 @@ hy2_activate() {
     # Canonicalize before comparing against SlowDNS's reserved port.
     hy2_port_valid "$port" || { err "Invalid or reserved UDP port."; pause; return; }
     port=$((10#$port))
+    if ! hy2_prepare_tools; then pause; return; fi
     if ! hy2_check_port "$port" "$hop"; then pause; return; fi
     if [ "$port" = 53 ] && hy2_slow_configured; then
         read -rp "  Stop only SlowDNS and transfer UDP 53 (restore on deactivate)? type YES: " answer
