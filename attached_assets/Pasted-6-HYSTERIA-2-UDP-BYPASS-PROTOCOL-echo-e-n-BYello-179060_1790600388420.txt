@@ -1,0 +1,83 @@
+6. HYSTERIA 2 (UDP BYPASS PROTOCOL)
+# ==========================================
+echo -e "\n${BYellow}[*] Installing Hysteria 2...${NC}"
+# Download and install the official Hysteria 2 binary
+bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1
+mkdir -p /etc/hysteria
+mkdir -p /etc/falcon/data
+touch /etc/falcon/data/hy2_users.txt
+chmod 755 /etc/falcon
+chmod 755 /etc/falcon/data
+chmod 644 /etc/falcon/data/hy2_users.txt
+# Create Bash Auth Script for Multi-User Support (Unbuffered, Sandbox-Safe)
+cat << 'EOF' > /etc/hysteria/auth.sh
+#!/bin/bash
+# Grab all input instantly without waiting for a newline
+INPUT=$(cat)
+
+# Extract the password the user typed
+PASS=$(echo "$INPUT" | jq -r '.auth' 2>/dev/null)
+
+if [ -z "$PASS" ] || [ "$PASS" == "null" ]; then
+    echo "false"
+    exit 0
+fi
+
+# Scrub the database of any invisible formatting (\r) that causes false rejections
+sed -i 's/\r//g' /etc/falcon/data/hy2_users.txt
+
+# Verify the password
+if awk '{print $2}' /etc/falcon/data/hy2_users.txt 2>/dev/null | grep -q -x "$PASS"; then
+    echo "true"
+else
+    echo "false"
+fi
+EOF
+
+chmod +x /etc/hysteria/auth.sh
+# Create Hysteria Config mapped to your Domain's SSL (Defaults to 4430 initially)
+cat <<EOF > /etc/hysteria/config.yaml
+listen: :4430
+tls:
+  cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
+  key: /etc/letsencrypt/live/$DOMAIN/privkey.pem
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+auth:
+  type: command
+  command: /etc/hysteria/auth.sh
+EOF
+
+# Overwrite Systemd Sandbox to allow pure Root execution
+cat << 'EOF' > /etc/systemd/system/hysteria-server.service
+[Unit]
+Description=Hysteria 2 Server Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/hysteria server --config /etc/hysteria/config.yaml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now hysteria-server.service >/dev/null 2>&1
+ufw allow 4430/udp >/dev/null 2>&1
+ufw allow 53/udp >/dev/null 2>&1
+clear
+echo -e "${BGreen}======================================================${NC}"
+echo -e "${BPurple}   PART 2 COMPLETE: PROTOCOLS INSTALLED SUCCESSFULLY  ${NC}"
+echo -e "${BGreen}======================================================${NC}"
+menu
+menu
+menu
+menu
+echo -e "\n${BYellow}[*] Compiling SlowDNS Server...${NC}"
+systemctl stop slowdns >
