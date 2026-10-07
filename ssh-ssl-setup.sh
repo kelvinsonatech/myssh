@@ -127,23 +127,13 @@ read -rp "$(echo -e "   ${SKY}❯${NC} ${BWHITE}Domain${NC} ${GRY}(blank = self-
 DOMAIN="$(echo "$DOMAIN" | tr -d '[:space:]')"
 echo ""
 
-# ── styled SlowDNS (NS) prompt — optional ──
-echo -e "  ${PINK}╭──────────────────────────────────────────────────────╮${NC}"
-echo -e "  ${PINK}│${NC}  ${BWHITE}${BOLD}SLOWDNS SETUP${NC} ${GRY}(optional)${NC}                          ${PINK}│${NC}"
-echo -e "  ${PINK}├──────────────────────────────────────────────────────┤${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}Enter the NS host delegated to this server's IP${NC}     ${PINK}│${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}(e.g. dns.example.com). Requires an NS + A record${NC}   ${PINK}│${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}at your DNS host. Leave blank to skip SlowDNS.${NC}      ${PINK}│${NC}"
-echo -e "  ${PINK}╰──────────────────────────────────────────────────────╯${NC}"
-echo ""
-read -rp "$(echo -e "   ${PINK}❯${NC} ${BWHITE}NS domain${NC} ${GRY}(blank = skip)${NC} : ")" NS_DOMAIN
-NS_DOMAIN="$(echo "$NS_DOMAIN" | tr -d '[:space:]')"
+# SlowDNS is opt-in from its submenu. Preserve any existing configuration.
+NS_DOMAIN=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null || true)
 
 apt-get install -y curl >/dev/null 2>&1 || true
 SERVER_IP=$(curl -s https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 echo "$DOMAIN"    > "$CONF_DIR/domain.conf"
 echo "$SERVER_IP" > "$CONF_DIR/ip.conf"
-echo "$NS_DOMAIN" > "$CONF_DIR/nsdomain.conf"
 
 # ── system info panel ──
 _OS=$( (. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME") || echo "Linux" )
@@ -637,7 +627,6 @@ if command -v ufw >/dev/null 2>&1; then
     for P in 22 80 109 143 443 447; do
         ufw allow ${P}/tcp >/dev/null 2>&1
     done
-    ufw allow 53/udp >/dev/null 2>&1   # SlowDNS (dnstt) tunnel
     success "UFW rules applied"
 else
     warn "ufw not found — open TCP ports manually: 22 80 109 143 443 447 + 53/udp"
@@ -1737,125 +1726,10 @@ systemctl restart vnstat >/dev/null 2>&1 || true
 success "Bandwidth monitor active on ${PRIMARY_IFACE:-auto}"
 
 # ═══════════════════════════════════════════
-# SECTION 6b2 — SLOWDNS (dnstt) — best-effort, never aborts the installer
-#   Tunnels UDP :53 -> OpenSSH 127.0.0.1:22. Whole phase runs with errexit
-#   OFF so a slow/failed apt, clone or build can never kill the install.
+# SECTION 6b2 — SLOWDNS — optional, installed only from its submenu
 # ═══════════════════════════════════════════
-phase "SlowDNS (dnstt)"
-set +e
-NS_DOMAIN=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)
-if [ -f /etc/hysteria2/slowdns.previous ] ||
-    [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
-    # Hysteria 2 owns the negotiated UDP :53 handover. Re-running this
-    # installer must never enable SlowDNS, kill its listener or fuser -k HY2.
-    warn "SlowDNS skipped — UDP 53 belongs to Hysteria 2; use menu 15 to restore SlowDNS."
-elif [ -n "$NS_DOMAIN" ]; then
-    systemctl stop slowdns >/dev/null 2>&1
-    killall dnstt-server >/dev/null 2>&1
-
-    # --- Free UDP 53: systemd-resolved holds it and silently kills dnstt.
-    #     Disable its stub listener but keep name resolution working. ---
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        mkdir -p /etc/systemd/resolved.conf.d
-        printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/slowdns.conf
-        rm -f /etc/resolv.conf 2>/dev/null
-        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-        systemctl restart systemd-resolved >/dev/null 2>&1
-    fi
-    fuser -k 53/udp >/dev/null 2>&1   # anything else squatting on :53
-
-    # --- Build dnstt-server. dnstt needs a modern Go (>=1.21); apt often ships
-    #     one too old (Debian 11=1.15, 12=1.19), so we try the toolchain on PATH
-    #     first and, if the build fails, install the official go.dev tarball and
-    #     retry. A helper does one build attempt with a given `go` binary. ---
-    if [ ! -x /usr/local/bin/dnstt-server ]; then
-        eval "$APT git golang-go ca-certificates" </dev/null >/dev/null 2>&1
-        cd /root; rm -rf dnstt
-        git clone https://www.bamsoftware.com/git/dnstt.git >/dev/null 2>&1
-
-        _try_build() {   # $1 = path to a go binary
-            [ -x "$1" ] || command -v "$1" >/dev/null 2>&1 || return 1
-            [ -d /root/dnstt/dnstt-server ] || return 1
-            (
-              cd /root/dnstt || exit 1
-              export HOME=/root GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
-              export GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org,direct
-              # Upstream currently pins old x/* modules that some package
-              # security filters reject. Use patched Go 1.22-compatible
-              # versions before building.
-              "$1" get golang.org/x/crypto@v0.31.0 \
-                  golang.org/x/net@v0.33.0 \
-                  golang.org/x/sys@v0.28.0 \
-                  golang.org/x/text@v0.21.0 || exit 1
-              cd dnstt-server || exit 1
-              "$1" build -o /tmp/dnstt-server . \
-                  && /tmp/dnstt-server -help >/dev/null 2>&1 \
-                  && install -m 0755 /tmp/dnstt-server /usr/local/bin/dnstt-server
-            ) >>/tmp/dnstt-build.log 2>&1
-        }
-
-        # 1) try whatever `go` apt gave us (fast path on modern distros)
-        APT_GO="$(command -v go 2>/dev/null)"
-        [ -n "$APT_GO" ] && _try_build "$APT_GO"
-
-        # 2) if that didn't produce a binary, fetch modern Go and retry
-        if [ ! -x /usr/local/bin/dnstt-server ]; then
-            ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
-            case "$ARCH" in
-                amd64|x86_64)  GOA=amd64;;
-                arm64|aarch64) GOA=arm64;;
-                armhf|armv7l)  GOA=armv6l;;
-                *)             GOA=amd64;;
-            esac
-            if curl -fsSL --connect-timeout 25 -o /tmp/go.tgz \
-                 "https://go.dev/dl/go1.22.12.linux-${GOA}.tar.gz" >/dev/null 2>&1; then
-                rm -rf /usr/local/go; tar -C /usr/local -xzf /tmp/go.tgz >/dev/null 2>&1
-                rm -f /tmp/go.tgz
-                _try_build /usr/local/go/bin/go
-            fi
-        fi
-    fi
-
-    if [ -x /usr/local/bin/dnstt-server ]; then
-        mkdir -p /etc/slowdns
-        # generate the server keypair once; reuse on re-runs
-        if [ ! -s /etc/slowdns/server.key ] || [ ! -s /etc/slowdns/server.pub ]; then
-            ( cd /etc/slowdns && /usr/local/bin/dnstt-server -gen-key \
-                -privkey-file server.key -pubkey-file server.pub >/dev/null 2>&1 )
-        fi
-
-        cat > /etc/systemd/system/slowdns.service <<EOF
-[Unit]
-Description=SlowDNS (dnstt) Tunnel Server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/slowdns
-ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key ${NS_DOMAIN} 127.0.0.1:22
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1
-        systemctl enable --now slowdns.service >/dev/null 2>&1
-        if systemctl is-active --quiet slowdns 2>/dev/null; then
-            success "SlowDNS active — UDP 53 -> OpenSSH 22 (NS: $NS_DOMAIN)"
-        else
-            warn "SlowDNS installed but not active — check: journalctl -u slowdns"
-        fi
-    else
-        warn "SlowDNS skipped — could not build dnstt-server (install continues)"
-        [ -s /tmp/dnstt-build.log ] \
-            && warn "Build details saved at /tmp/dnstt-build.log"
-    fi
-else
-    info "SlowDNS skipped — no NS domain provided"
-fi
-set -e   # re-enable errexit for the rest of the installer
+phase "SlowDNS: menu only"
+info "SlowDNS installation is available from its submenu; existing settings are untouched."
 
 # ═══════════════════════════════════════════
 # SECTION 6c — XRAY HELPER SCRIPTS (config generator + quota/expiry checker)
@@ -2878,6 +2752,287 @@ xray_menu() {
     done
 }
 
+# SlowDNS installation is deliberately independent of all other protocol setup.
+slowdns_go_usable() {
+    local version
+    version=$(env -u GOROOT GOENV=off GOTOOLCHAIN=local "$1" version 2>/dev/null) || return 1
+    [[ "$version" =~ ^go[[:space:]]version[[:space:]]go([0-9]+\.[0-9]+(\.[0-9]+)?)[[:space:]] ]] || return 1
+    version=${BASH_REMATCH[1]}
+    [ "$(printf '%s\n' 1.27.1 "$version" | sort -V | head -n1)" = 1.27.1 ] || return 1
+    env -u GOROOT GOENV=off GOTOOLCHAIN=local "$1" list crypto/ecdh >/dev/null 2>&1
+}
+
+slowdns_step() (
+    # Real progress labels, not a fake percentage. Output is retained in a log.
+    local label="$1" spinner="" result; shift
+    trap '[ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; }; printf "\r\033[K\033[?25h"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '  %s\n' "$label"
+    if [ -t 1 ]; then
+        printf '\033[?25l'
+        (while :; do
+            for frame in '|' '/' '-' '\'; do
+                printf '\r  [%s] %s' "$frame" "$label"; sleep 0.15
+            done
+        done) &
+        spinner=$!
+    fi
+    "$@" >>"$SD_LOG" 2>&1
+    result=$?
+    [ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; spinner=""; }
+    if [ "$result" = 0 ]; then printf '\r\033[K  [OK] %s\n' "$label"
+    else printf '\r\033[K  [FAILED] %s — see %s\n' "$label" "$SD_LOG"; fi
+    exit "$result"
+)
+
+slowdns_dependencies() {
+    local tool package
+    local -a packages=()
+    for tool in curl git ss iptables ip6tables nft; do
+        command -v "$tool" >/dev/null 2>&1 && continue
+        case "$tool" in
+            ss) package=iproute2;; iptables|ip6tables) package=iptables;;
+            nft) package=nftables;; *) package="$tool";;
+        esac
+        [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
+    [ "${#packages[@]}" = 0 ] && return 0
+    command -v apt-get >/dev/null || { echo "Debian/Ubuntu apt-get is required."; return 1; }
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-install-recommends "${packages[@]}"
+}
+
+slowdns_prepare_go() {
+    local candidate arch sha destination=/opt/ssh-panel/toolchains/go1.27.1
+    for candidate in "$(command -v go 2>/dev/null)" "$destination/bin/go"; do
+        [ -n "$candidate" ] || continue
+        if slowdns_go_usable "$candidate"; then
+            printf '%s\n' "$candidate" > "$SD_WORK/go-path"
+            env -u GOROOT GOENV=off GOTOOLCHAIN=local "$candidate" version
+            return 0
+        fi
+    done
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; sha=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445;;
+        aarch64|arm64) arch=arm64; sha=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec;;
+        armv7l|armv6l) arch=armv6l; sha=44893f200fb034791d4188df9fc9b9e73eadbb5fceafd5166703f0b9bab73fc2;;
+        *) echo "Unsupported Go architecture: $(uname -m)"; return 1;;
+    esac
+    # Never remove distro Go, /usr/local/go, or change a user's PATH/profile.
+    [ ! -e "$destination" ] ||
+        { echo "Private Go directory exists but failed verification: $destination"; return 1; }
+    curl -4 -fL --retry 2 --connect-timeout 20 --max-time 600 \
+        "https://go.dev/dl/go1.27.1.linux-$arch.tar.gz" -o "$SD_WORK/go.tgz" || return 1
+    printf '%s  %s\n' "$sha" "$SD_WORK/go.tgz" | sha256sum -c - || return 1
+    tar -xzf "$SD_WORK/go.tgz" -C "$SD_WORK" || return 1
+    slowdns_go_usable "$SD_WORK/go/bin/go" || { echo "Go or crypto/ecdh verification failed."; return 1; }
+    mkdir -p "${destination%/*}" || return 1
+    mv "$SD_WORK/go" "$destination" || return 1
+    printf '%s\n' "$destination/bin/go" > "$SD_WORK/go-path"
+}
+
+slowdns_build() (
+    local go
+    go=$(cat "$SD_WORK/go-path") || exit 1
+    export GOENV=off GOTOOLCHAIN=local GOPATH="$SD_WORK/gopath" GOCACHE="$SD_WORK/gocache"
+    export GOPROXY=https://proxy.golang.org,direct GOFLAGS=-mod=mod
+    unset GOROOT
+    # Upstream uses dumb HTTP transport, which does not support shallow clones.
+    git clone https://www.bamsoftware.com/git/dnstt.git "$SD_WORK/source" || exit 1
+    cd "$SD_WORK/source" || exit 1
+    "$go" get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0 \
+        golang.org/x/sys@v0.28.0 golang.org/x/text@v0.21.0 || exit 1
+    "$go" build -o "$SD_WORK/dnstt-server" ./dnstt-server || exit 1
+    "$SD_WORK/dnstt-server" -help || exit 1
+    if [ -s /etc/slowdns/server.key ] && [ -s /etc/slowdns/server.pub ]; then
+        cp -p /etc/slowdns/server.key /etc/slowdns/server.pub "$SD_WORK/" || exit 1
+    elif [ -e /etc/slowdns/server.key ] || [ -e /etc/slowdns/server.pub ]; then
+        echo "Incomplete existing key pair. Refusing to overwrite client keys."; exit 1
+    else
+        "$SD_WORK/dnstt-server" -gen-key -privkey-file "$SD_WORK/server.key" \
+            -pubkey-file "$SD_WORK/server.pub" || exit 1
+    fi
+)
+
+slowdns_port_check() {
+    local line
+    if [ -f /etc/hysteria2/slowdns.previous ] ||
+        [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+        echo "Hysteria 2 owns UDP 53. Use its existing deactivate/restore option first."
+        return 1
+    fi
+    # Reuse read-only inspectors, not HY2 activation or firewall writers.
+    hy2_snapshot || return 1
+    if hy2_nat_conflict 53 53 || hy2_nft_conflict 53 53; then
+        echo "Existing UDP 53 redirect; refusing to change another protocol's rules."; return 1
+    fi
+    SD_RESOLVED=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [[ "$line" == *'("systemd-resolve"'* ]] &&
+            systemctl is-active --quiet systemd-resolved.service; then
+            SD_RESOLVED=1
+        else
+            echo "UDP 53 is occupied. No listener will be killed: $line"; return 1
+        fi
+    done < <(printf '%s\n' "$HY2_SS" | awk '$4 ~ /:53$/')
+    if [ "$SD_RESOLVED" = 1 ]; then
+        # Use the server's actual upstream resolvers, never invent replacements.
+        grep -qE '^nameserver[[:space:]]+[^[:space:]]+' /run/systemd/resolve/resolv.conf ||
+            { echo "No resolved upstream resolver file; refusing to change DNS."; return 1; }
+    fi
+}
+
+slowdns_deploy() (
+    # Only inactive SlowDNS may be installed/repaired. All changes are backed up
+    # before mutation; failure/signal restores files, resolver and enable state.
+    local committed=0 touched=0 resolved_changed=0 enabled=0 path i=0
+    local dropin=/etc/systemd/resolved.conf.d/zz-ssh-panel-slowdns.conf
+    local -a files=(/usr/local/bin/dnstt-server /etc/systemd/system/slowdns.service
+        "$CONF_DIR/nsdomain.conf" /etc/slowdns/server.key /etc/slowdns/server.pub
+        "$dropin" /etc/resolv.conf)
+    rollback() {
+        [ "$committed" = 1 ] || [ "$touched" = 0 ] && return
+        systemctl stop slowdns.service || true
+        i=0
+        for path in "${files[@]}"; do
+            rm -f "$path"
+            [ ! -e "$SD_WORK/backup/$i" ] && [ ! -L "$SD_WORK/backup/$i" ] ||
+                cp -a "$SD_WORK/backup/$i" "$path" || echo "RESTORE FAILED: $path"
+            i=$((i+1))
+        done
+        systemctl daemon-reload || true
+        if [ "$enabled" = 1 ]; then systemctl enable slowdns.service || true
+        else systemctl disable slowdns.service || true; fi
+        if [ "$resolved_changed" = 1 ]; then systemctl restart systemd-resolved.service || true; fi
+        echo "SlowDNS activation failed; prior files restored. Review this log for restore errors."
+    }
+    trap rollback EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    systemctl is-active --quiet slowdns.service &&
+        { echo "SlowDNS became active; refusing to interrupt it."; exit 1; }
+    slowdns_port_check || exit 1
+    systemctl is-enabled --quiet slowdns.service && enabled=1
+    mkdir -p "$SD_WORK/backup" || exit 1
+    for path in "${files[@]}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$SD_WORK/backup/$i" || exit 1; fi
+        i=$((i+1))
+    done
+    touched=1
+    mkdir -p /etc/slowdns "$CONF_DIR" /etc/systemd/resolved.conf.d || exit 1
+    if [ "$SD_RESOLVED" = 1 ]; then
+        resolved_changed=1
+        printf '[Resolve]\nDNSStubListener=no\n' > "$dropin" || exit 1
+        # Preserve regular resolver files; only switch a symlink/regular file
+        # containing a loopback nameserver that would otherwise stop resolving.
+        if grep -qE '^nameserver[[:space:]]+(127\.|::1([[:space:]]|$))' /etc/resolv.conf; then
+            rm -f /etc/resolv.conf || exit 1
+            ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf || exit 1
+        fi
+        systemctl restart systemd-resolved.service || exit 1
+        systemctl is-active --quiet systemd-resolved.service || exit 1
+        getent ahosts go.dev >/dev/null || { echo "DNS resolution check failed."; exit 1; }
+    fi
+    # A second inspection catches another service binding while we built.
+    slowdns_port_check || exit 1
+    [ "$SD_RESOLVED" = 0 ] || { echo "Resolved still occupies UDP 53."; exit 1; }
+    install -m 755 "$SD_WORK/dnstt-server" /usr/local/bin/dnstt-server || exit 1
+    install -m 600 "$SD_WORK/server.key" /etc/slowdns/server.key || exit 1
+    install -m 644 "$SD_WORK/server.pub" /etc/slowdns/server.pub || exit 1
+    printf '%s\n' "$SD_NS" > "$CONF_DIR/nsdomain.conf" || exit 1
+    cat > /etc/systemd/system/slowdns.service <<SDUNIT
+[Unit]
+Description=SlowDNS (dnstt) Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/slowdns
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key ${SD_NS} 127.0.0.1:22
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SDUNIT
+    [ "$?" = 0 ] || exit 1
+    systemctl daemon-reload || exit 1
+    systemctl enable --now slowdns.service || exit 1
+    sleep 2
+    systemctl is-active --quiet slowdns.service || exit 1
+    ss -H -lunp | grep -E ':53[[:space:]].*dnstt-server' >/dev/null || exit 1
+    committed=1
+    if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+        ufw allow 53/udp || echo "WARNING: UFW could not allow UDP 53; review firewall manually."
+    fi
+    return 0
+)
+
+slowdns_install() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local SD_WORK SD_LOG SD_NS answer SD_RESOLVED SD_KEEP=0
+    section "INSTALL SLOWDNS" "$PINK"
+    if systemctl is-active --quiet slowdns.service; then
+        note "SlowDNS is already running. Its configuration and keys were left unchanged."; pause; return
+    fi
+    if [ -f /etc/hysteria2/slowdns.previous ] ||
+        [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+        err "Hysteria 2 owns UDP 53. Use menu 15's existing deactivate/restore option first."; pause; return
+    fi
+    note "Go 1.27.1+ is used privately for SlowDNS; system Go and other tunnels stay unchanged."
+    note "Only a resolved stub on UDP 53 may be adjusted; upstream DNS is preserved and failures roll back."
+    note "Your NS delegation must point to this server. Provider firewall must allow UDP 53."
+    read -rp "  NS domain (e.g. dns.example.com): " SD_NS
+    [[ ${#SD_NS} -le 253 && "$SD_NS" == *.* &&
+        "$SD_NS" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] ||
+        { err "Invalid NS domain."; pause; return; }
+    read -rp "  Install SlowDNS and required tools? (y/N): " answer
+    [[ "$answer" = y || "$answer" = Y ]] || return
+    umask 077
+    SD_WORK=$(mktemp -d /tmp/slowdns-install.XXXXXX) || return
+    SD_LOG=$(mktemp /var/log/slowdns-install.XXXXXX.log) || { rm -rf "$SD_WORK"; return; }
+    trap '[ "$SD_KEEP" = 1 ] || rm -rf "$SD_WORK"; printf "\033[?25h"' EXIT
+    trap 'SD_KEEP=1; exit 130' INT
+    trap 'SD_KEEP=1; exit 143' TERM
+    # Serialize only SlowDNS installs. Never acquire/modify another protocol's state.
+    exec 9>/run/lock/ssh-panel-slowdns.lock
+    flock -n 9 || { err "Another SlowDNS install is in progress."; pause; return; }
+    slowdns_step "Checking required tools" slowdns_dependencies ||
+        { err "Dependency check failed. Log: $SD_LOG"; pause; return; }
+    slowdns_port_check >>"$SD_LOG" 2>&1 ||
+        { err "UDP 53 safety check failed. Log: $SD_LOG"; tail -n 4 "$SD_LOG"; pause; return; }
+    slowdns_step "Checking Go version and crypto/ecdh; preparing Go 1.27.1 if needed" slowdns_prepare_go ||
+        { err "Go preparation failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
+    slowdns_step "Building and verifying dnstt-server" slowdns_build ||
+        { err "Build failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
+    slowdns_step "Activating SlowDNS with rollback protection" slowdns_deploy ||
+        { SD_KEEP=1; err "Activation failed. Log: $SD_LOG; recovery files: $SD_WORK/backup"; pause; return; }
+    ok "SlowDNS is active on UDP 53. Keys were preserved. Log: $SD_LOG"
+    note "If your firewall blocks UDP 53, allow it explicitly; no existing firewall rules were replaced."
+    pause
+)
+
+slowdns_menu() {
+    local choice
+    while :; do
+        section "SLOWDNS" "$PINK"
+        echo "  1) Install SlowDNS / repair an inactive installation"
+        echo "  2) Status and connection details"
+        echo "  0) Back"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1) slowdns_install;;
+            2) slowdns_info;;
+            0|"") return;;
+            *) err "Invalid option.";;
+        esac
+    done
+}
+
 slowdns_info() {
     section "SLOWDNS (DNSTT)" "$PINK"
     local col="$PINK"
@@ -2887,7 +3042,7 @@ slowdns_info() {
     line_top "$col"
     if [ -z "$ns" ] || [ ! -x /usr/local/bin/dnstt-server ]; then
         row "$col" "${GR}SlowDNS is not installed on this server.${NC}"
-        row "$col" "${GR}Re-run the installer and enter an NS domain.${NC}"
+        row "$col" "${GR}Choose Install SlowDNS in this submenu.${NC}"
         line_bot "$col"; pause; return
     fi
     if systemctl is-active --quiet slowdns 2>/dev/null; then
@@ -3899,7 +4054,7 @@ while true; do
     menu_item "8" "📶" "Bandwidth usage"          "$SKY"
     menu_item "9" "🌐" "Xray / V2Ray (VMess)"     "$PINK"
     menu_item "10" "🔄" "Restart all services"    "$Y"
-    menu_item "11" "🐌" "SlowDNS info"            "$PINK"
+    menu_item "11" "🐌" "SlowDNS setup / info"    "$PINK"
     menu_item "12" "🛡 " "Abuse protection"        "$LIME"
     menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
@@ -3918,7 +4073,7 @@ while true; do
         8) bandwidth ;;
         9) xray_menu ;;
         10) restart_services ;;
-        11) slowdns_info ;;
+        11) slowdns_menu ;;
         12) abuse_menu ;;
         13) hysteria_menu ;;
         14) fastdns_menu ;;

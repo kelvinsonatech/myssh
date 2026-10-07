@@ -1,34 +1,41 @@
 ---
-name: SlowDNS (dnstt) UDP 53 binding
-description: Why SlowDNS silently fails to start and how the installer fixes it
+name: SlowDNS isolation and toolchain policy
+description: User scope constraints, safe UDP 53 ownership and upstream build pitfalls
 ---
 
-# SlowDNS (dnstt-server) needs UDP 53 free, or it silently dies
+# Scope and safety
 
-`dnstt-server -udp :53 ...` binds 0.0.0.0:53. On most Ubuntu/Debian VPS,
-`systemd-resolved` (or dnsmasq) already occupies port 53, so the systemd unit
-starts, fails to bind, and keeps restarting with no obvious error to the user.
+The user explicitly requested optional SlowDNS installation from its submenu,
+with no NS prompt during main setup, Go 1.27.1 minimum and animated progress.
+They repeated: "just focus on the slow dns"; Hysteria 2 and the other protocols
+are working alternatives and must retain their existing settings and behavior.
 
-**Why:** two SlowDNS install attempts "looked correct" (matched a working
-reference installer) but the tunnel never came up — the missing step was freeing
-port 53, which neither the reference nor the first attempt did.
+**Why:** old distro Go caused crypto/ecdh build failures. Removing distro Go or
+replacing /usr/local/go could break unrelated software. Use a private toolchain
+for this build rather than globally changing the server's Go or root profile.
 
-**How to apply:** before starting slowdns, disable resolved's stub listener
-(`/etc/systemd/resolved.conf.d/*.conf` -> `[Resolve]\nDNSStubListener=no`),
-rewrite `/etc/resolv.conf` to a real resolver (1.1.1.1/8.8.8.8) so name
-resolution still works, `fuser -k 53/udp`, then restart resolved. After
-`systemctl restart slowdns`, verify with `systemctl is-active` and surface a
-warning pointing at `journalctl -u slowdns` if it's not active. Also open
-UDP 53 in ufw. Client needs: NS domain, server.pub key, a public DNS resolver,
-and a normal SSH account (SlowDNS just tunnels to 127.0.0.1:22).
+**How to apply:** do not broaden SlowDNS maintenance into HY2 fixes or protocol
+refactors. Compile before any port/service changes. Never kill unknown UDP 53
+listeners. Respect the existing HY2 handover rather than creating another switch.
 
-**Do not let SlowDNS abort the installer.** The main script runs `set -e`. The
-SlowDNS phase has unguarded fail-prone commands (apt, `git clone` bamsoftware,
-`go build`); a non-zero exit there killed the whole install (left the box with
-no `menu`). Wrap the entire phase in `set +e` … `set -e`. Toolchain: try apt
-`golang-go` first, fall back to the official go.dev tarball (arch-aware) — apt's
-Go can be too old to build current dnstt. Backend is `127.0.0.1:22` (OpenSSH),
-matching the SSL-payload backend. Working impl landed after the errexit guard.
+## UDP 53 and systemd-resolved
+
+Wildcard dnstt needs port 53 free; an apparently started service may just be in a
+restart loop. A resolved stub may be adjusted only with upstream DNS preserved
+and a rollback copy of the original resolver file or symlink.
+
+**Why:** previous instructions to fuser-kill port 53 or replace all nameservers
+were unsafe for a multi-protocol VPS. They are superseded; do not reintroduce them.
+
+**How to apply:** check actual listening state after startup, fail closed on
+unknown listeners and redirect rules, and retain rollback backups after failure.
+
+## Upstream source transport
+
+Use a full clone of bamsoftware's dnstt repository, not a shallow clone.
+
+**Why:** the upstream endpoint uses dumb HTTP; shallow clones fail with
+"dumb http transport does not support shallow capabilities".
 
 ## Dependency versions can block the dnstt build
 
@@ -42,4 +49,4 @@ discarded, the installer only reported a generic failure.
 **How to apply:** before building, upgrade the pinned `x/crypto`, `x/net`,
 `x/sys`, and `x/text` modules to patched releases compatible with the fallback Go
 toolchain. Keep the source build as the trusted path, validate the produced
-binary, and preserve `/tmp/dnstt-build.log` when installation still fails.
+binary, and preserve build logs when installation fails.
