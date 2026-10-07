@@ -2764,27 +2764,59 @@ slowdns_go_usable() {
 
 slowdns_step() (
     # Real progress labels, not a fake percentage. Output is retained in a log.
-    local label="$1" spinner="" result; shift
+    local label="$1" spinner="" result start=$SECONDS icon="◈" title width track; shift
+    case "$label" in
+        1/4*) icon="◇"; title="SERVER CHECK";;
+        2/4*) icon="⚙"; title="GO ENGINE";;
+        3/4*) icon="◆"; title="TUNNEL BUILD";;
+        4/4*) icon="↗"; title="GOING ONLINE";;
+        *) title="$label";;
+    esac
     trap '[ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; }; printf "\r\033[K\033[?25h"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    printf '  %s\n' "$label"
     if [ -t 1 ]; then
+        width=$(tput cols 2>/dev/null) || width=40
+        [[ "$width" =~ ^[0-9]+$ ]] || width=40
+        track=$((width-19)); (( track > 22 )) && track=22
+        (( track < 4 )) && track=4
+        printf '\n  \033[38;5;44m%s\033[0m \033[1m%s\033[0m \033[2m%s\033[0m\n' "$icon" "$title" "${label%% *}"
         printf '\033[?25l'
-        (local start=$SECONDS frame elapsed
+        (local frame=0 elapsed head cell distance glyph color bar pulse
+        local -a pulses=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
         while :; do
-            for frame in '●·······' '·●······' '··●·····' '···●····' '····●···' '·····●··' '······●·' '·······●'; do
-                elapsed=$((SECONDS-start))
-                printf '\r\033[K  \033[38;5;44m[%s]\033[0m  %ss' "$frame" "$elapsed"; sleep 0.12
+            elapsed=$((SECONDS-start)); head=$((frame % track)); bar=""
+            for ((cell=0; cell<track; cell++)); do
+                distance=$(((head-cell+track)%track))
+                case "$distance" in
+                    0) glyph="●"; color=159;;
+                    1) glyph="━"; color=51;;
+                    2) glyph="━"; color=44;;
+                    3) glyph="─"; color=30;;
+                    *) glyph="─"; color=238;;
+                esac
+                bar+="\033[38;5;${color}m${glyph}"
             done
+            pulse=${pulses[$((frame % 10))]}
+            printf '\r\033[K  \033[38;5;44m%s  %b\033[0m  \033[2m%02d:%02d\033[0m' \
+                "$pulse" "$bar" "$((elapsed/60))" "$((elapsed%60))"
+            frame=$((frame+1)); sleep 0.09
         done) &
         spinner=$!
+    else
+        printf '  %s\n' "$label"
     fi
     "$@" >>"$SD_LOG" 2>&1
     result=$?
     [ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; spinner=""; }
-    if [ "$result" = 0 ]; then printf '\r\033[K  [OK] %s\n' "$label"
-    else printf '\r\033[K  [FAILED] %s — see %s\n' "$label" "$SD_LOG"; fi
+    if [ -t 1 ]; then
+        if [ "$result" = 0 ]; then
+            printf '\r\033[K  \033[38;5;118m✓ COMPLETE\033[0m  \033[2m%ss\033[0m\n' "$((SECONDS-start))"
+        else
+            printf '\r\033[K  \033[1;31m✕ STOPPED\033[0m — see %s\n' "$SD_LOG"
+        fi
+    elif [ "$result" = 0 ]; then printf '  [OK] %s\n' "$label"
+    else printf '  [FAILED] %s — see %s\n' "$label" "$SD_LOG"; fi
     exit "$result"
 )
 
