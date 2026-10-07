@@ -5,6 +5,13 @@ description: User scope constraints, safe UDP 53 ownership and upstream build pi
 
 # Scope and safety
 
+The user confirmed the optional install works. Their subsequent UI requirement
+is one SlowDNS action: animate setup, then display details; when already active,
+show "Currently activated" and details without reinstalling or restarting.
+
+**Why:** the user wants no intermediate install/status submenu or redundant
+confirmation. Ask for an NS domain only when it has not already been configured.
+
 The user explicitly requested optional SlowDNS installation from its submenu,
 with no NS prompt during main setup, Go 1.27.1 minimum and animated progress.
 They repeated: "just focus on the slow dns"; Hysteria 2 and the other protocols

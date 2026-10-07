@@ -2771,9 +2771,11 @@ slowdns_step() (
     printf '  %s\n' "$label"
     if [ -t 1 ]; then
         printf '\033[?25l'
-        (while :; do
-            for frame in '|' '/' '-' '\'; do
-                printf '\r  [%s] %s' "$frame" "$label"; sleep 0.15
+        (local start=$SECONDS frame elapsed
+        while :; do
+            for frame in '●·······' '·●······' '··●·····' '···●····' '····●···' '·····●··' '······●·' '·······●'; do
+                elapsed=$((SECONDS-start))
+                printf '\r\033[K  \033[38;5;44m[%s]\033[0m  %ss' "$frame" "$elapsed"; sleep 0.12
             done
         done) &
         spinner=$!
@@ -2974,10 +2976,10 @@ SDUNIT
 
 slowdns_install() (
     export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
-    local SD_WORK SD_LOG SD_NS answer SD_RESOLVED SD_KEEP=0
+    local SD_WORK SD_LOG SD_NS SD_RESOLVED SD_KEEP=0
     section "INSTALL SLOWDNS" "$PINK"
     if systemctl is-active --quiet slowdns.service; then
-        note "SlowDNS is already running. Its configuration and keys were left unchanged."; pause; return
+        slowdns_info; return
     fi
     if [ -f /etc/hysteria2/slowdns.previous ] ||
         [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
@@ -2986,12 +2988,13 @@ slowdns_install() (
     note "Go 1.27.1+ is used privately for SlowDNS; system Go and other tunnels stay unchanged."
     note "Only a resolved stub on UDP 53 may be adjusted; upstream DNS is preserved and failures roll back."
     note "Your NS delegation must point to this server. Provider firewall must allow UDP 53."
-    read -rp "  NS domain (e.g. dns.example.com): " SD_NS
+    SD_NS=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)
+    if [ -z "$SD_NS" ]; then
+        read -rp "  NS domain (e.g. dns.example.com): " SD_NS
+    fi
     [[ ${#SD_NS} -le 253 && "$SD_NS" == *.* &&
         "$SD_NS" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] ||
         { err "Invalid NS domain."; pause; return; }
-    read -rp "  Install SlowDNS and required tools? (y/N): " answer
-    [[ "$answer" = y || "$answer" = Y ]] || return
     umask 077
     SD_WORK=$(mktemp -d /tmp/slowdns-install.XXXXXX) || return
     SD_LOG=$(mktemp /var/log/slowdns-install.XXXXXX.log) || { rm -rf "$SD_WORK"; return; }
@@ -3001,36 +3004,27 @@ slowdns_install() (
     # Serialize only SlowDNS installs. Never acquire/modify another protocol's state.
     exec 9>/run/lock/ssh-panel-slowdns.lock
     flock -n 9 || { err "Another SlowDNS install is in progress."; pause; return; }
-    slowdns_step "Checking required tools" slowdns_dependencies ||
+    slowdns_step "1/4  Checking server requirements" slowdns_dependencies ||
         { err "Dependency check failed. Log: $SD_LOG"; pause; return; }
     slowdns_port_check >>"$SD_LOG" 2>&1 ||
         { err "UDP 53 safety check failed. Log: $SD_LOG"; tail -n 4 "$SD_LOG"; pause; return; }
-    slowdns_step "Checking Go version and crypto/ecdh; preparing Go 1.27.1 if needed" slowdns_prepare_go ||
+    slowdns_step "2/4  Preparing compatible Go" slowdns_prepare_go ||
         { err "Go preparation failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
-    slowdns_step "Building and verifying dnstt-server" slowdns_build ||
+    slowdns_step "3/4  Building and verifying SlowDNS" slowdns_build ||
         { err "Build failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
-    slowdns_step "Activating SlowDNS with rollback protection" slowdns_deploy ||
+    slowdns_step "4/4  Activating and checking connection" slowdns_deploy ||
         { SD_KEEP=1; err "Activation failed. Log: $SD_LOG; recovery files: $SD_WORK/backup"; pause; return; }
     ok "SlowDNS is active on UDP 53. Keys were preserved. Log: $SD_LOG"
     note "If your firewall blocks UDP 53, allow it explicitly; no existing firewall rules were replaced."
-    pause
+    slowdns_info
 )
 
 slowdns_menu() {
-    local choice
-    while :; do
-        section "SLOWDNS" "$PINK"
-        echo "  1) Install SlowDNS / repair an inactive installation"
-        echo "  2) Status and connection details"
-        echo "  0) Back"
-        read -rp "  Select: " choice
-        case "$choice" in
-            1) slowdns_install;;
-            2) slowdns_info;;
-            0|"") return;;
-            *) err "Invalid option.";;
-        esac
-    done
+    if systemctl is-active --quiet slowdns.service; then
+        slowdns_info
+    else
+        slowdns_install
+    fi
 }
 
 slowdns_info() {
@@ -3042,15 +3036,16 @@ slowdns_info() {
     line_top "$col"
     if [ -z "$ns" ] || [ ! -x /usr/local/bin/dnstt-server ]; then
         row "$col" "${GR}SlowDNS is not installed on this server.${NC}"
-        row "$col" "${GR}Choose Install SlowDNS in this submenu.${NC}"
+        row "$col" "${GR}Select SlowDNS from the main menu to set it up.${NC}"
         line_bot "$col"; pause; return
     fi
-    if systemctl is-active --quiet slowdns 2>/dev/null; then
-        st="${G}● running${NC}"; else st="${R}○ stopped${NC}"; fi
+    if systemctl is-active --quiet slowdns.service 2>/dev/null; then
+        st="${G}Currently activated${NC}"; else st="${R}Not active${NC}"; fi
     row "$col" "${GR}Status${NC}    $st"
     row "$col" "${GR}NS domain${NC} ${W}${ns}${NC}"
     row "$col" "${GR}Backend${NC}   ${W}127.0.0.1:22 (OpenSSH)${NC}"
     row "$col" "${GR}Server IP${NC} ${W}${SERVER_IP}${NC}"
+    row "$col" "${GR}Port${NC}      ${W}53 (UDP)${NC}"
     line_mid "$col"
     row "$col" "${GR}Public key${NC}"
     row "$col" "${W}${pub}${NC}"

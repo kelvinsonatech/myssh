@@ -116,3 +116,20 @@ if grep -E '^(stop|restart|disable|enable --now) (hysteria|xray|ssh|stunnel|drop
     echo "Touched another protocol"; exit 1
 fi
 echo "PASS: Go version/ecdh, checksum failure, port refusal, rollback, and isolated deployment"
+# The single SlowDNS action shows details immediately when active; it must not
+# run the installer or prompt in that path.
+sed -n '/^slowdns_menu() {/,/^slowdns_info() {/p' scripts/ssh-ssl-setup.sh |
+    sed '$d' > "$tmp/menu-functions"
+source "$tmp/menu-functions"
+(
+    slowdns_info() { echo details >> "$tmp/actions"; }
+    slowdns_install() { echo install >> "$tmp/actions"; }
+    SD_STARTED=1
+    slowdns_menu
+    [ "$(cat "$tmp/actions")" = details ]
+    : > "$tmp/actions"
+    SD_STARTED=0
+    slowdns_menu
+    [ "$(cat "$tmp/actions")" = install ]
+)
+echo "PASS: active SlowDNS is view-only; inactive SlowDNS enters setup directly"
