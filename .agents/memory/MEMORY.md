@@ -4,5 +4,6 @@
 - [WS/SSH proxy payload handling](ws-ssh-proxy-payload.md) — reply 100-continue then strip HTTP junk up to the SSH- banner before bridging; else two-stage payloads corrupt the handshake.
 - [Browser DoH bypass](abuse-guard-doh-bypass.md) — Google-result bypass = browser DoH on 443; poison ~45 DoH bootstrap hostnames + Firefox canary NXDOMAIN, never touch 443.
 - [Hysteria UDP tunnel](hysteria-udp.md) — menu 13; user:pass auth, obfs, port-hop UDP 20000-50000→36712; UDP-only so can't break TCP protocols; NOT for zero-data/payload.
-- [SlowDNS UDP 53](slowdns-udp53.md) — dnstt silently fails unless port 53 is freed (disable systemd-resolved stub); verify is-active after start.
+- [SlowDNS isolation](slowdns-udp53.md) — submenu-only, private Go; protect working protocols, preserve DNS, never kill unknown UDP 53 owners.
 - [Hysteria 2 coexistence](hysteria2-isolation.md) — isolate from HY1; UDP 53 handover requires confirmation and restoration, including installer/restart paths.
+- [ZIVPN isolation](zivpn-isolation.md) — actual upstream binary only; protect other protocols, real Android-client proof still required.

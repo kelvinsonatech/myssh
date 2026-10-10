@@ -127,23 +127,13 @@ read -rp "$(echo -e "   ${SKY}❯${NC} ${BWHITE}Domain${NC} ${GRY}(blank = self-
 DOMAIN="$(echo "$DOMAIN" | tr -d '[:space:]')"
 echo ""
 
-# ── styled SlowDNS (NS) prompt — optional ──
-echo -e "  ${PINK}╭──────────────────────────────────────────────────────╮${NC}"
-echo -e "  ${PINK}│${NC}  ${BWHITE}${BOLD}SLOWDNS SETUP${NC} ${GRY}(optional)${NC}                          ${PINK}│${NC}"
-echo -e "  ${PINK}├──────────────────────────────────────────────────────┤${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}Enter the NS host delegated to this server's IP${NC}     ${PINK}│${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}(e.g. dns.example.com). Requires an NS + A record${NC}   ${PINK}│${NC}"
-echo -e "  ${PINK}│${NC}  ${GRY}at your DNS host. Leave blank to skip SlowDNS.${NC}      ${PINK}│${NC}"
-echo -e "  ${PINK}╰──────────────────────────────────────────────────────╯${NC}"
-echo ""
-read -rp "$(echo -e "   ${PINK}❯${NC} ${BWHITE}NS domain${NC} ${GRY}(blank = skip)${NC} : ")" NS_DOMAIN
-NS_DOMAIN="$(echo "$NS_DOMAIN" | tr -d '[:space:]')"
+# SlowDNS is opt-in from its submenu. Preserve any existing configuration.
+NS_DOMAIN=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null || true)
 
 apt-get install -y curl >/dev/null 2>&1 || true
 SERVER_IP=$(curl -s https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 echo "$DOMAIN"    > "$CONF_DIR/domain.conf"
 echo "$SERVER_IP" > "$CONF_DIR/ip.conf"
-echo "$NS_DOMAIN" > "$CONF_DIR/nsdomain.conf"
 
 # ── system info panel ──
 _OS=$( (. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME") || echo "Linux" )
@@ -637,7 +627,6 @@ if command -v ufw >/dev/null 2>&1; then
     for P in 22 80 109 143 443 447; do
         ufw allow ${P}/tcp >/dev/null 2>&1
     done
-    ufw allow 53/udp >/dev/null 2>&1   # SlowDNS (dnstt) tunnel
     success "UFW rules applied"
 else
     warn "ufw not found — open TCP ports manually: 22 80 109 143 443 447 + 53/udp"
@@ -1737,125 +1726,10 @@ systemctl restart vnstat >/dev/null 2>&1 || true
 success "Bandwidth monitor active on ${PRIMARY_IFACE:-auto}"
 
 # ═══════════════════════════════════════════
-# SECTION 6b2 — SLOWDNS (dnstt) — best-effort, never aborts the installer
-#   Tunnels UDP :53 -> OpenSSH 127.0.0.1:22. Whole phase runs with errexit
-#   OFF so a slow/failed apt, clone or build can never kill the install.
+# SECTION 6b2 — SLOWDNS — optional, installed only from its submenu
 # ═══════════════════════════════════════════
-phase "SlowDNS (dnstt)"
-set +e
-NS_DOMAIN=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)
-if [ -f /etc/hysteria2/slowdns.previous ] ||
-    [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
-    # Hysteria 2 owns the negotiated UDP :53 handover. Re-running this
-    # installer must never enable SlowDNS, kill its listener or fuser -k HY2.
-    warn "SlowDNS skipped — UDP 53 belongs to Hysteria 2; use menu 15 to restore SlowDNS."
-elif [ -n "$NS_DOMAIN" ]; then
-    systemctl stop slowdns >/dev/null 2>&1
-    killall dnstt-server >/dev/null 2>&1
-
-    # --- Free UDP 53: systemd-resolved holds it and silently kills dnstt.
-    #     Disable its stub listener but keep name resolution working. ---
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        mkdir -p /etc/systemd/resolved.conf.d
-        printf '[Resolve]\nDNSStubListener=no\n' > /etc/systemd/resolved.conf.d/slowdns.conf
-        rm -f /etc/resolv.conf 2>/dev/null
-        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-        systemctl restart systemd-resolved >/dev/null 2>&1
-    fi
-    fuser -k 53/udp >/dev/null 2>&1   # anything else squatting on :53
-
-    # --- Build dnstt-server. dnstt needs a modern Go (>=1.21); apt often ships
-    #     one too old (Debian 11=1.15, 12=1.19), so we try the toolchain on PATH
-    #     first and, if the build fails, install the official go.dev tarball and
-    #     retry. A helper does one build attempt with a given `go` binary. ---
-    if [ ! -x /usr/local/bin/dnstt-server ]; then
-        eval "$APT git golang-go ca-certificates" </dev/null >/dev/null 2>&1
-        cd /root; rm -rf dnstt
-        git clone https://www.bamsoftware.com/git/dnstt.git >/dev/null 2>&1
-
-        _try_build() {   # $1 = path to a go binary
-            [ -x "$1" ] || command -v "$1" >/dev/null 2>&1 || return 1
-            [ -d /root/dnstt/dnstt-server ] || return 1
-            (
-              cd /root/dnstt || exit 1
-              export HOME=/root GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
-              export GOFLAGS=-mod=mod GOPROXY=https://proxy.golang.org,direct
-              # Upstream currently pins old x/* modules that some package
-              # security filters reject. Use patched Go 1.22-compatible
-              # versions before building.
-              "$1" get golang.org/x/crypto@v0.31.0 \
-                  golang.org/x/net@v0.33.0 \
-                  golang.org/x/sys@v0.28.0 \
-                  golang.org/x/text@v0.21.0 || exit 1
-              cd dnstt-server || exit 1
-              "$1" build -o /tmp/dnstt-server . \
-                  && /tmp/dnstt-server -help >/dev/null 2>&1 \
-                  && install -m 0755 /tmp/dnstt-server /usr/local/bin/dnstt-server
-            ) >>/tmp/dnstt-build.log 2>&1
-        }
-
-        # 1) try whatever `go` apt gave us (fast path on modern distros)
-        APT_GO="$(command -v go 2>/dev/null)"
-        [ -n "$APT_GO" ] && _try_build "$APT_GO"
-
-        # 2) if that didn't produce a binary, fetch modern Go and retry
-        if [ ! -x /usr/local/bin/dnstt-server ]; then
-            ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
-            case "$ARCH" in
-                amd64|x86_64)  GOA=amd64;;
-                arm64|aarch64) GOA=arm64;;
-                armhf|armv7l)  GOA=armv6l;;
-                *)             GOA=amd64;;
-            esac
-            if curl -fsSL --connect-timeout 25 -o /tmp/go.tgz \
-                 "https://go.dev/dl/go1.22.12.linux-${GOA}.tar.gz" >/dev/null 2>&1; then
-                rm -rf /usr/local/go; tar -C /usr/local -xzf /tmp/go.tgz >/dev/null 2>&1
-                rm -f /tmp/go.tgz
-                _try_build /usr/local/go/bin/go
-            fi
-        fi
-    fi
-
-    if [ -x /usr/local/bin/dnstt-server ]; then
-        mkdir -p /etc/slowdns
-        # generate the server keypair once; reuse on re-runs
-        if [ ! -s /etc/slowdns/server.key ] || [ ! -s /etc/slowdns/server.pub ]; then
-            ( cd /etc/slowdns && /usr/local/bin/dnstt-server -gen-key \
-                -privkey-file server.key -pubkey-file server.pub >/dev/null 2>&1 )
-        fi
-
-        cat > /etc/systemd/system/slowdns.service <<EOF
-[Unit]
-Description=SlowDNS (dnstt) Tunnel Server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/slowdns
-ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key ${NS_DOMAIN} 127.0.0.1:22
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1
-        systemctl enable --now slowdns.service >/dev/null 2>&1
-        if systemctl is-active --quiet slowdns 2>/dev/null; then
-            success "SlowDNS active — UDP 53 -> OpenSSH 22 (NS: $NS_DOMAIN)"
-        else
-            warn "SlowDNS installed but not active — check: journalctl -u slowdns"
-        fi
-    else
-        warn "SlowDNS skipped — could not build dnstt-server (install continues)"
-        [ -s /tmp/dnstt-build.log ] \
-            && warn "Build details saved at /tmp/dnstt-build.log"
-    fi
-else
-    info "SlowDNS skipped — no NS domain provided"
-fi
-set -e   # re-enable errexit for the rest of the installer
+phase "SlowDNS: menu only"
+info "SlowDNS installation is available from its submenu; existing settings are untouched."
 
 # ═══════════════════════════════════════════
 # SECTION 6c — XRAY HELPER SCRIPTS (config generator + quota/expiry checker)
@@ -2878,6 +2752,313 @@ xray_menu() {
     done
 }
 
+# SlowDNS installation is deliberately independent of all other protocol setup.
+slowdns_go_usable() {
+    local version
+    version=$(env -u GOROOT GOENV=off GOTOOLCHAIN=local "$1" version 2>/dev/null) || return 1
+    [[ "$version" =~ ^go[[:space:]]version[[:space:]]go([0-9]+\.[0-9]+(\.[0-9]+)?)[[:space:]] ]] || return 1
+    version=${BASH_REMATCH[1]}
+    [ "$(printf '%s\n' 1.27.1 "$version" | sort -V | head -n1)" = 1.27.1 ] || return 1
+    env -u GOROOT GOENV=off GOTOOLCHAIN=local "$1" list crypto/ecdh >/dev/null 2>&1
+}
+
+slowdns_step() (
+    # Real progress labels, not a fake percentage. Output is retained in a log.
+    local label="$1" spinner="" result start=$SECONDS icon="◈" title width track; shift
+    case "$label" in
+        1/4*) icon="◇"; title="SERVER CHECK";;
+        2/4*) icon="⚙"; title="GO ENGINE";;
+        3/4*) icon="◆"; title="TUNNEL BUILD";;
+        4/4*) icon="↗"; title="GOING ONLINE";;
+        *) title="$label";;
+    esac
+    trap '[ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; }; printf "\r\033[K\033[?25h"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ -t 1 ]; then
+        width=$(tput cols 2>/dev/null) || width=40
+        [[ "$width" =~ ^[0-9]+$ ]] || width=40
+        track=$((width-19)); (( track > 22 )) && track=22
+        (( track < 4 )) && track=4
+        printf '\n  \033[38;5;44m%s\033[0m \033[1m%s\033[0m \033[2m%s\033[0m\n' "$icon" "$title" "${label%% *}"
+        printf '\033[?25l'
+        (local frame=0 elapsed head cell distance glyph color bar pulse
+        local -a pulses=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        while :; do
+            elapsed=$((SECONDS-start)); head=$((frame % track)); bar=""
+            for ((cell=0; cell<track; cell++)); do
+                distance=$(((head-cell+track)%track))
+                case "$distance" in
+                    0) glyph="●"; color=159;;
+                    1) glyph="━"; color=51;;
+                    2) glyph="━"; color=44;;
+                    3) glyph="─"; color=30;;
+                    *) glyph="─"; color=238;;
+                esac
+                bar+="\033[38;5;${color}m${glyph}"
+            done
+            pulse=${pulses[$((frame % 10))]}
+            printf '\r\033[K  \033[38;5;44m%s  %b\033[0m  \033[2m%02d:%02d\033[0m' \
+                "$pulse" "$bar" "$((elapsed/60))" "$((elapsed%60))"
+            frame=$((frame+1)); sleep 0.09
+        done) &
+        spinner=$!
+    else
+        printf '  %s\n' "$label"
+    fi
+    "$@" >>"$SD_LOG" 2>&1
+    result=$?
+    [ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; spinner=""; }
+    if [ -t 1 ]; then
+        if [ "$result" = 0 ]; then
+            printf '\r\033[K  \033[38;5;118m✓ COMPLETE\033[0m  \033[2m%ss\033[0m\n' "$((SECONDS-start))"
+        else
+            printf '\r\033[K  \033[1;31m✕ STOPPED\033[0m — see %s\n' "$SD_LOG"
+        fi
+    elif [ "$result" = 0 ]; then printf '  [OK] %s\n' "$label"
+    else printf '  [FAILED] %s — see %s\n' "$label" "$SD_LOG"; fi
+    exit "$result"
+)
+
+slowdns_dependencies() {
+    local tool package
+    local -a packages=()
+    for tool in curl git ss iptables ip6tables nft; do
+        command -v "$tool" >/dev/null 2>&1 && continue
+        case "$tool" in
+            ss) package=iproute2;; iptables|ip6tables) package=iptables;;
+            nft) package=nftables;; *) package="$tool";;
+        esac
+        [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
+    [ "${#packages[@]}" = 0 ] && return 0
+    command -v apt-get >/dev/null || { echo "Debian/Ubuntu apt-get is required."; return 1; }
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-install-recommends "${packages[@]}"
+}
+
+slowdns_prepare_go() {
+    local candidate arch sha destination=/opt/ssh-panel/toolchains/go1.27.1
+    for candidate in "$(command -v go 2>/dev/null)" "$destination/bin/go"; do
+        [ -n "$candidate" ] || continue
+        if slowdns_go_usable "$candidate"; then
+            printf '%s\n' "$candidate" > "$SD_WORK/go-path"
+            env -u GOROOT GOENV=off GOTOOLCHAIN=local "$candidate" version
+            return 0
+        fi
+    done
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; sha=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445;;
+        aarch64|arm64) arch=arm64; sha=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec;;
+        armv7l|armv6l) arch=armv6l; sha=44893f200fb034791d4188df9fc9b9e73eadbb5fceafd5166703f0b9bab73fc2;;
+        *) echo "Unsupported Go architecture: $(uname -m)"; return 1;;
+    esac
+    # Never remove distro Go, /usr/local/go, or change a user's PATH/profile.
+    [ ! -e "$destination" ] ||
+        { echo "Private Go directory exists but failed verification: $destination"; return 1; }
+    curl -4 -fL --retry 2 --connect-timeout 20 --max-time 600 \
+        "https://go.dev/dl/go1.27.1.linux-$arch.tar.gz" -o "$SD_WORK/go.tgz" || return 1
+    printf '%s  %s\n' "$sha" "$SD_WORK/go.tgz" | sha256sum -c - || return 1
+    tar -xzf "$SD_WORK/go.tgz" -C "$SD_WORK" || return 1
+    slowdns_go_usable "$SD_WORK/go/bin/go" || { echo "Go or crypto/ecdh verification failed."; return 1; }
+    mkdir -p "${destination%/*}" || return 1
+    mv "$SD_WORK/go" "$destination" || return 1
+    printf '%s\n' "$destination/bin/go" > "$SD_WORK/go-path"
+}
+
+slowdns_build() (
+    local go
+    go=$(cat "$SD_WORK/go-path") || exit 1
+    export GOENV=off GOTOOLCHAIN=local GOPATH="$SD_WORK/gopath" GOCACHE="$SD_WORK/gocache"
+    export GOPROXY=https://proxy.golang.org,direct GOFLAGS=-mod=mod
+    unset GOROOT
+    # Upstream uses dumb HTTP transport, which does not support shallow clones.
+    git clone https://www.bamsoftware.com/git/dnstt.git "$SD_WORK/source" || exit 1
+    cd "$SD_WORK/source" || exit 1
+    "$go" get golang.org/x/crypto@v0.31.0 golang.org/x/net@v0.33.0 \
+        golang.org/x/sys@v0.28.0 golang.org/x/text@v0.21.0 || exit 1
+    "$go" build -o "$SD_WORK/dnstt-server" ./dnstt-server || exit 1
+    "$SD_WORK/dnstt-server" -help || exit 1
+    if [ -s /etc/slowdns/server.key ] && [ -s /etc/slowdns/server.pub ]; then
+        cp -p /etc/slowdns/server.key /etc/slowdns/server.pub "$SD_WORK/" || exit 1
+    elif [ -e /etc/slowdns/server.key ] || [ -e /etc/slowdns/server.pub ]; then
+        echo "Incomplete existing key pair. Refusing to overwrite client keys."; exit 1
+    else
+        "$SD_WORK/dnstt-server" -gen-key -privkey-file "$SD_WORK/server.key" \
+            -pubkey-file "$SD_WORK/server.pub" || exit 1
+    fi
+)
+
+slowdns_port_check() {
+    local line
+    if [ -f /etc/hysteria2/slowdns.previous ] ||
+        [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+        echo "Hysteria 2 owns UDP 53. Use its existing deactivate/restore option first."
+        return 1
+    fi
+    # Reuse read-only inspectors, not HY2 activation or firewall writers.
+    hy2_snapshot || return 1
+    if hy2_nat_conflict 53 53 || hy2_nft_conflict 53 53; then
+        echo "Existing UDP 53 redirect; refusing to change another protocol's rules."; return 1
+    fi
+    SD_RESOLVED=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [[ "$line" == *'("systemd-resolve"'* ]] &&
+            systemctl is-active --quiet systemd-resolved.service; then
+            SD_RESOLVED=1
+        else
+            echo "UDP 53 is occupied. No listener will be killed: $line"; return 1
+        fi
+    done < <(printf '%s\n' "$HY2_SS" | awk '$4 ~ /:53$/')
+    if [ "$SD_RESOLVED" = 1 ]; then
+        # Use the server's actual upstream resolvers, never invent replacements.
+        grep -qE '^nameserver[[:space:]]+[^[:space:]]+' /run/systemd/resolve/resolv.conf ||
+            { echo "No resolved upstream resolver file; refusing to change DNS."; return 1; }
+    fi
+}
+
+slowdns_deploy() (
+    # Only inactive SlowDNS may be installed/repaired. All changes are backed up
+    # before mutation; failure/signal restores files, resolver and enable state.
+    local committed=0 touched=0 resolved_changed=0 enabled=0 path i=0
+    local dropin=/etc/systemd/resolved.conf.d/zz-ssh-panel-slowdns.conf
+    local -a files=(/usr/local/bin/dnstt-server /etc/systemd/system/slowdns.service
+        "$CONF_DIR/nsdomain.conf" /etc/slowdns/server.key /etc/slowdns/server.pub
+        "$dropin" /etc/resolv.conf)
+    rollback() {
+        [ "$committed" = 1 ] || [ "$touched" = 0 ] && return
+        systemctl stop slowdns.service || true
+        i=0
+        for path in "${files[@]}"; do
+            rm -f "$path"
+            [ ! -e "$SD_WORK/backup/$i" ] && [ ! -L "$SD_WORK/backup/$i" ] ||
+                cp -a "$SD_WORK/backup/$i" "$path" || echo "RESTORE FAILED: $path"
+            i=$((i+1))
+        done
+        systemctl daemon-reload || true
+        if [ "$enabled" = 1 ]; then systemctl enable slowdns.service || true
+        else systemctl disable slowdns.service || true; fi
+        if [ "$resolved_changed" = 1 ]; then systemctl restart systemd-resolved.service || true; fi
+        echo "SlowDNS activation failed; prior files restored. Review this log for restore errors."
+    }
+    trap rollback EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    systemctl is-active --quiet slowdns.service &&
+        { echo "SlowDNS became active; refusing to interrupt it."; exit 1; }
+    slowdns_port_check || exit 1
+    systemctl is-enabled --quiet slowdns.service && enabled=1
+    mkdir -p "$SD_WORK/backup" || exit 1
+    for path in "${files[@]}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$SD_WORK/backup/$i" || exit 1; fi
+        i=$((i+1))
+    done
+    touched=1
+    mkdir -p /etc/slowdns "$CONF_DIR" /etc/systemd/resolved.conf.d || exit 1
+    if [ "$SD_RESOLVED" = 1 ]; then
+        resolved_changed=1
+        printf '[Resolve]\nDNSStubListener=no\n' > "$dropin" || exit 1
+        # Preserve regular resolver files; only switch a symlink/regular file
+        # containing a loopback nameserver that would otherwise stop resolving.
+        if grep -qE '^nameserver[[:space:]]+(127\.|::1([[:space:]]|$))' /etc/resolv.conf; then
+            rm -f /etc/resolv.conf || exit 1
+            ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf || exit 1
+        fi
+        systemctl restart systemd-resolved.service || exit 1
+        systemctl is-active --quiet systemd-resolved.service || exit 1
+        getent ahosts go.dev >/dev/null || { echo "DNS resolution check failed."; exit 1; }
+    fi
+    # A second inspection catches another service binding while we built.
+    slowdns_port_check || exit 1
+    [ "$SD_RESOLVED" = 0 ] || { echo "Resolved still occupies UDP 53."; exit 1; }
+    install -m 755 "$SD_WORK/dnstt-server" /usr/local/bin/dnstt-server || exit 1
+    install -m 600 "$SD_WORK/server.key" /etc/slowdns/server.key || exit 1
+    install -m 644 "$SD_WORK/server.pub" /etc/slowdns/server.pub || exit 1
+    printf '%s\n' "$SD_NS" > "$CONF_DIR/nsdomain.conf" || exit 1
+    cat > /etc/systemd/system/slowdns.service <<SDUNIT
+[Unit]
+Description=SlowDNS (dnstt) Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/slowdns
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/slowdns/server.key ${SD_NS} 127.0.0.1:22
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SDUNIT
+    [ "$?" = 0 ] || exit 1
+    systemctl daemon-reload || exit 1
+    systemctl enable --now slowdns.service || exit 1
+    sleep 2
+    systemctl is-active --quiet slowdns.service || exit 1
+    ss -H -lunp | grep -E ':53[[:space:]].*dnstt-server' >/dev/null || exit 1
+    committed=1
+    if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+        ufw allow 53/udp || echo "WARNING: UFW could not allow UDP 53; review firewall manually."
+    fi
+    return 0
+)
+
+slowdns_install() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local SD_WORK SD_LOG SD_NS SD_RESOLVED SD_KEEP=0
+    section "INSTALL SLOWDNS" "$PINK"
+    if systemctl is-active --quiet slowdns.service; then
+        slowdns_info; return
+    fi
+    if [ -f /etc/hysteria2/slowdns.previous ] ||
+        [ "$(cat /etc/hysteria2/port 2>/dev/null)" = 53 ]; then
+        err "Hysteria 2 owns UDP 53. Use menu 15's existing deactivate/restore option first."; pause; return
+    fi
+    note "Go 1.27.1+ is used privately for SlowDNS; system Go and other tunnels stay unchanged."
+    note "Only a resolved stub on UDP 53 may be adjusted; upstream DNS is preserved and failures roll back."
+    note "Your NS delegation must point to this server. Provider firewall must allow UDP 53."
+    SD_NS=$(cat "$CONF_DIR/nsdomain.conf" 2>/dev/null)
+    if [ -z "$SD_NS" ]; then
+        read -rp "  NS domain (e.g. dns.example.com): " SD_NS
+    fi
+    [[ ${#SD_NS} -le 253 && "$SD_NS" == *.* &&
+        "$SD_NS" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] ||
+        { err "Invalid NS domain."; pause; return; }
+    umask 077
+    SD_WORK=$(mktemp -d /tmp/slowdns-install.XXXXXX) || return
+    SD_LOG=$(mktemp /var/log/slowdns-install.XXXXXX.log) || { rm -rf "$SD_WORK"; return; }
+    trap '[ "$SD_KEEP" = 1 ] || rm -rf "$SD_WORK"; printf "\033[?25h"' EXIT
+    trap 'SD_KEEP=1; exit 130' INT
+    trap 'SD_KEEP=1; exit 143' TERM
+    # Serialize only SlowDNS installs. Never acquire/modify another protocol's state.
+    exec 9>/run/lock/ssh-panel-slowdns.lock
+    flock -n 9 || { err "Another SlowDNS install is in progress."; pause; return; }
+    slowdns_step "1/4  Checking server requirements" slowdns_dependencies ||
+        { err "Dependency check failed. Log: $SD_LOG"; pause; return; }
+    slowdns_port_check >>"$SD_LOG" 2>&1 ||
+        { err "UDP 53 safety check failed. Log: $SD_LOG"; tail -n 4 "$SD_LOG"; pause; return; }
+    slowdns_step "2/4  Preparing compatible Go" slowdns_prepare_go ||
+        { err "Go preparation failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
+    slowdns_step "3/4  Building and verifying SlowDNS" slowdns_build ||
+        { err "Build failed; existing services unchanged. Log: $SD_LOG"; pause; return; }
+    slowdns_step "4/4  Activating and checking connection" slowdns_deploy ||
+        { SD_KEEP=1; err "Activation failed. Log: $SD_LOG; recovery files: $SD_WORK/backup"; pause; return; }
+    ok "SlowDNS is active on UDP 53. Keys were preserved. Log: $SD_LOG"
+    note "If your firewall blocks UDP 53, allow it explicitly; no existing firewall rules were replaced."
+    slowdns_info
+)
+
+slowdns_menu() {
+    if systemctl is-active --quiet slowdns.service; then
+        slowdns_info
+    else
+        slowdns_install
+    fi
+}
+
 slowdns_info() {
     section "SLOWDNS (DNSTT)" "$PINK"
     local col="$PINK"
@@ -2887,15 +3068,16 @@ slowdns_info() {
     line_top "$col"
     if [ -z "$ns" ] || [ ! -x /usr/local/bin/dnstt-server ]; then
         row "$col" "${GR}SlowDNS is not installed on this server.${NC}"
-        row "$col" "${GR}Re-run the installer and enter an NS domain.${NC}"
+        row "$col" "${GR}Select SlowDNS from the main menu to set it up.${NC}"
         line_bot "$col"; pause; return
     fi
-    if systemctl is-active --quiet slowdns 2>/dev/null; then
-        st="${G}● running${NC}"; else st="${R}○ stopped${NC}"; fi
+    if systemctl is-active --quiet slowdns.service 2>/dev/null; then
+        st="${G}Currently activated${NC}"; else st="${R}Not active${NC}"; fi
     row "$col" "${GR}Status${NC}    $st"
     row "$col" "${GR}NS domain${NC} ${W}${ns}${NC}"
     row "$col" "${GR}Backend${NC}   ${W}127.0.0.1:22 (OpenSSH)${NC}"
     row "$col" "${GR}Server IP${NC} ${W}${SERVER_IP}${NC}"
+    row "$col" "${GR}Port${NC}      ${W}53 (UDP)${NC}"
     line_mid "$col"
     row "$col" "${GR}Public key${NC}"
     row "$col" "${W}${pub}${NC}"
@@ -3881,6 +4063,388 @@ hy2_menu() {
     done
 }
 
+# ZIVPN — isolated upstream binary, data, unit and ownership-scoped firewall.
+ZI_DIR=/etc/zivpn
+ZI_BIN=/usr/local/bin/zivpn
+ZI_FW=/usr/local/bin/zivpn-panel-firewall
+ZI_UNIT=/etc/systemd/system/zivpn.service
+
+zi_owned() { [ -f "$ZI_DIR/.ssh-panel-owned" ]; }
+zi_active() { systemctl is-active --quiet zivpn.service 2>/dev/null; }
+
+zi_guard() {
+    local n line
+    # Reserve inactive HY2 custom ports too. Never edit its configuration.
+    n=$(cat /etc/hysteria2/port 2>/dev/null || true)
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n == 5667 || (n >= 6000 && n <= 19999) )); then
+        err "ZIVPN overlaps the configured Hysteria 2 port; activation refused."; return 1
+    fi
+    hy2_snapshot || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$(awk '{print $4}' <<< "$line"); n=${n##*:}
+        [[ "$n" =~ ^[0-9]+$ ]] || { err "Cannot identify a UDP listener safely."; return 1; }
+        if (( n == 5667 || (n >= 6000 && n <= 19999) )); then
+            err "UDP $n already occupied. No service was stopped."; return 1
+        fi
+    done <<< "$HY2_SS"
+    if hy2_nat_conflict 5667 5667 || hy2_nat_conflict 6000 19999 ||
+        hy2_nft_conflict 5667 5667 || hy2_nft_conflict 6000 19999; then
+        err "Existing NAT rules overlap ZIVPN; refusing to replace them."; return 1
+    fi
+    # Broad redirects and complex predicates cannot prove these ports are free.
+    # Conservatively reject them instead of guessing through arbitrary chains.
+    while IFS= read -r line; do
+        [[ "$line" == -A* ]] || continue
+        [[ "$line" == *' -p tcp '* || "$line" == *' -p icmp '* || "$line" == *' -p ipv6-icmp '* ]] && continue
+        if [[ "$line" == *' ! '* || "$line" == *'--match-set'* ||
+            ( "$line" == *' -j '* && "$line" != *'--dport '* && "$line" != *'--dports '* ) ]]; then
+            err "Unscoped NAT rule needs manual review; no firewall changes made."; return 1
+        fi
+    done <<< "$HY2_NAT4"$'\n'"$HY2_NAT6"
+    while IFS= read -r line; do
+        [[ "$line" =~ (redirect|dnat|tproxy) ]] || continue
+        [[ "$line" == *'tcp dport '* ]] && continue
+        [[ "$line" == *'udp dport '* || "$line" == *'th dport '* ]] ||
+            { err "Unscoped nft redirect needs manual review."; return 1; }
+    done <<< "$HY2_NFT"
+}
+
+zi_write_support() {
+    # Embed read-only inspectors for boot-time checks, with no menu dependency.
+    {
+        printf '#!/bin/bash\nexport PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH\n'
+        printf 'err() { echo "$*" >&2; }\n'
+        declare -f hy2_missing_tools hy2_snapshot hy2_nat_conflict hy2_nft_conflict zi_guard
+        cat <<'ZIFW'
+DIR=/etc/zivpn
+[ -f "$DIR/.ssh-panel-owned" ] || exit 1
+exec 9>/run/lock/zivpn-panel-firewall.lock
+flock -x 9 || exit 1
+input=(-p udp --dport 5667 -m comment --comment ZIVPN-PANEL-OWNED -j ACCEPT)
+cleanup() {
+    local iface result=0
+    iptables -w 5 -S INPUT >/dev/null && iptables -w 5 -t nat -S PREROUTING >/dev/null || return 1
+    while iptables -w 5 -C INPUT "${input[@]}" 2>/dev/null; do
+        iptables -w 5 -D INPUT "${input[@]}" || { result=1; break; }
+    done
+    if [ -f "$DIR/firewall-interface" ]; then
+        read -r iface < "$DIR/firewall-interface"
+        [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+        local rule=(-i "$iface" -p udp --dport 6000:19999 -m comment --comment ZIVPN-PANEL-OWNED -j DNAT --to-destination :5667)
+        while iptables -w 5 -t nat -C PREROUTING "${rule[@]}" 2>/dev/null; do
+            iptables -w 5 -t nat -D PREROUTING "${rule[@]}" || { result=1; break; }
+        done
+    fi
+    return "$result"
+}
+case "${1:-}" in
+    down) cleanup; exit $?;;
+    up)
+        cleanup || exit 1
+        zi_guard || exit 1
+        iface=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+        [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { err "No IPv4 default interface."; exit 1; }
+        printf '%s\n' "$iface" > "$DIR/firewall-interface" || exit 1
+        trap 'cleanup' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        iptables -w 5 -I INPUT 1 "${input[@]}" || exit 1
+        iptables -w 5 -t nat -A PREROUTING -i "$iface" -p udp --dport 6000:19999 \
+            -m comment --comment ZIVPN-PANEL-OWNED -j DNAT --to-destination :5667 || exit 1
+        trap - EXIT INT TERM;;
+    *) exit 2;;
+esac
+ZIFW
+    } > "$ZI_FW" || return 1
+    chmod 700 "$ZI_FW" || return 1
+    cat > "$ZI_UNIT" <<'ZIUNIT'
+[Unit]
+Description=ZIVPN UDP tunnel (isolated SSH panel service)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+WorkingDirectory=/etc/zivpn
+ExecStartPre=/usr/local/bin/zivpn-panel-firewall up
+ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
+ExecStopPost=/usr/local/bin/zivpn-panel-firewall down
+Restart=on-failure
+RestartSec=5
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+ZIUNIT
+}
+
+zi_config() {
+    # Passwords are JSON application credentials, never Linux users.
+    python3 - "$1" "$2" "$ZI_DIR" <<'ZIPY'
+import json,sys
+passwords=[p.rstrip("\n") for p in open(sys.argv[1])]
+if not passwords or any(not p or len(p)>128 for p in passwords):
+    raise SystemExit("At least one nonempty password is required.")
+if len(set(passwords)) != len(passwords):
+    raise SystemExit("Duplicate passwords are not allowed.")
+root=sys.argv[3]
+with open(sys.argv[2],"w") as f:
+    json.dump({"listen":":5667","cert":root+"/zivpn.crt","key":root+"/zivpn.key",
+               "obfs":"zivpn","auth":{"mode":"passwords","config":passwords}},f,indent=2)
+ZIPY
+}
+
+zi_start() {
+    zi_owned || { err "ZIVPN is not managed by this menu."; return 1; }
+    zi_active && return 0
+    # Remove only stale panel-owned rules; inspect again before systemd starts.
+    "$ZI_FW" down || return 1
+    zi_guard || return 1
+    if systemctl enable --now zivpn.service; then
+        sleep 2
+        if zi_active && ss -H -lunp | grep -E ':5667[[:space:]].*"zivpn"' >/dev/null; then
+            return 0
+        fi
+    fi
+    systemctl disable --now zivpn.service >/dev/null 2>&1
+    "$ZI_FW" down
+    err "ZIVPN failed to start. Other services were not restarted. See journalctl -u zivpn."
+    return 1
+}
+
+zi_prepare_tools() {
+    local tool package missing=""
+    local -a tools=(curl openssl python3 ip ss iptables ip6tables nft flock sha256sum)
+    local -a packages=()
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    for tool in "${tools[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 && continue
+        case "$tool" in
+            ip|ss) package=iproute2;;
+            iptables|ip6tables) package=iptables;;
+            nft) package=nftables;;
+            flock) package=util-linux;;
+            sha256sum) package=coreutils;;
+            *) package="$tool";;
+        esac
+        [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    [ "${#packages[@]}" = 0 ] && return 0
+    command -v apt-get >/dev/null 2>&1 ||
+        { err "Missing tools require Debian/Ubuntu apt-get: ${packages[*]}"; return 1; }
+    note "Preparing ZIVPN prerequisites: ${packages[*]}"
+    # Tool packages only; never install a firewall manager/persistence package,
+    # upgrade the system, change alternatives, or flush/replace existing rules.
+    if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-remove --no-install-recommends "${packages[@]}"; then
+        err "Prerequisite installation failed. Review apt output above; ZIVPN was not activated."
+        return 1
+    fi
+    hash -r
+    for tool in "${tools[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=" $tool"
+    done
+    [ -z "$missing" ] ||
+        { err "Still missing:$missing. ZIVPN activation stopped safely."; return 1; }
+}
+
+zi_install() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    umask 077
+    local work arch sha password answer tool created=0 complete=0
+    if zi_owned; then
+        zi_prepare_tools && zi_start && zi_details
+        pause; return
+    fi
+    for tool in "$ZI_DIR" "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"; do
+        [ ! -e "$tool" ] || { err "Existing unmanaged ZIVPN files found: $tool. Nothing overwritten."; pause; return; }
+    done
+    if systemctl cat zivpn.service >/dev/null 2>&1; then
+        err "An existing ZIVPN service is not owned by this menu."; pause; return
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; sha=df6658c195882ff2f6cefb44050e8cb2c238ceb2b6e3fbefb931698f4f0519cb;;
+        aarch64|arm64) arch=arm64; sha=1bc3f0a46db2b4a4771dd08e68e2134c55d7c48874334ed7bba512d983bfa83a;;
+        *) err "This ZIVPN integration supports amd64 and arm64 only."; pause; return;;
+    esac
+    zi_prepare_tools || { pause; return; }
+    zi_guard || { pause; return; }
+    note "ZIVPN will use UDP 5667 and 6000–19999, with its own reboot-persistent rules."
+    note "No system upgrades, global buffer tuning, or other protocol restarts."
+    note "Uses the upstream closed binary. Real Android-app compatibility still needs confirmation."
+    read -rp "  Install and activate ZIVPN? type YES: " answer
+    [ "$answer" = YES ] || return
+    read -rsp "  First tunnel password (8–128 characters, blank = generate): " password; echo
+    [ -n "$password" ] || password=$(openssl rand -hex 12)
+    (( ${#password} >= 8 && ${#password} <= 128 )) ||
+        { err "Password must be 8–128 characters."; pause; return; }
+    work=$(mktemp -d) || return
+    trap 'if [ "$created" = 1 ] && [ "$complete" = 0 ]; then
+        rm -f "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"
+        rm -rf "$ZI_DIR"
+        systemctl daemon-reload >/dev/null 2>&1
+    fi; rm -rf "$work"' EXIT
+    note "Downloading and verifying upstream ZIVPN..."
+    curl -fL --retry 2 --connect-timeout 20 --max-time 120 \
+        "https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-$arch" \
+        -o "$work/zivpn" ||
+        { err "Download failed; no service changed."; pause; return; }
+    printf '%s  %s\n' "$sha" "$work/zivpn" | sha256sum -c --status ||
+        { err "Binary checksum mismatch. Installation refused."; pause; return; }
+    chmod 700 "$work/zivpn"
+    "$work/zivpn" -h > "$work/version" 2>&1 && grep -qi zivpn "$work/version" ||
+        { err "ZIVPN binary cannot run on this server."; pause; return; }
+    openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 -subj '/CN=zivpn' \
+        -keyout "$work/zivpn.key" -out "$work/zivpn.crt" >/dev/null 2>&1 ||
+        { err "Certificate generation failed."; pause; return; }
+    printf '%s\n' "$password" > "$work/passwords"
+    zi_config "$work/passwords" "$work/config.json" || { pause; return; }
+    zi_guard || { pause; return; }
+    # All downloading and configuration generation finish before service changes.
+    mkdir -m 700 "$ZI_DIR" || return
+    created=1
+    touch "$ZI_DIR/.ssh-panel-owned"
+    install -m 755 "$work/zivpn" "$ZI_BIN" &&
+        install -m 600 "$work/config.json" "$work/zivpn.key" "$work/zivpn.crt" "$ZI_DIR/" &&
+        zi_write_support && systemctl daemon-reload ||
+        { err "ZIVPN setup failed; incomplete ZIVPN files will be removed. Other protocols untouched."; pause; return; }
+    complete=1
+    if zi_start; then ok "ZIVPN activated. Open the ZIVPN Android app with the details below."; zi_details; fi
+    pause
+)
+
+zi_details() {
+    zi_owned || { note "Not installed. Choose Install / activate."; return; }
+    line_top "$TEAL"
+    if zi_active; then row "$TEAL" "${G}Currently activated${NC}"
+    else row "$TEAL" "${Y}Currently inactive${NC}"; fi
+    row "$TEAL" "Server IPv4: ${SERVER_IP:-not configured}"
+    row "$TEAL" "Client UDP ports: 6000–19999"
+    row "$TEAL" "Server listener: 5667 / UDP"
+    row "$TEAL" "Client: ZIVPN Android (password only)"
+    if systemctl is-enabled --quiet zivpn.service 2>/dev/null; then
+        row "$TEAL" "Reboot: automatic startup enabled"
+    else row "$TEAL" "Reboot: automatic startup disabled"; fi
+    line_bot "$TEAL"
+    note "Passwords are private. No Linux username or SNI is required."
+    python3 - "$ZI_DIR/config.json" <<'ZIPASSWORDS'
+import json,sys
+try:
+    config=json.load(open(sys.argv[1]))
+    for i,password in enumerate(config["auth"]["config"],1):
+        print(f"  Password {i}: {password}")
+except (OSError,ValueError,KeyError,TypeError) as e:
+    raise SystemExit(f"Cannot read ZIVPN passwords: {e}")
+ZIPASSWORDS
+    note "No automatic expiry is configured. Deletion/restart disconnects ZIVPN sessions."
+    note "Self-signed TLS; allow UDP 6000–19999 in your provider firewall."
+}
+
+zi_passwords() (
+    umask 077
+    local action="$1" work password number answer active=0 restarted=0
+    zi_owned || { err "Install ZIVPN first."; pause; return; }
+    work=$(mktemp -d "$ZI_DIR/.edit.XXXXXX") || return
+    trap 'rm -rf "$work"' EXIT
+    python3 - "$ZI_DIR/config.json" "$work/passwords" <<'ZILIST'
+import json,sys
+data=json.load(open(sys.argv[1]))
+with open(sys.argv[2],"w") as f:
+    f.write("".join(p+"\n" for p in data["auth"]["config"]))
+ZILIST
+    [ "$?" = 0 ] || { err "Invalid existing config; nothing changed."; pause; return; }
+    if [ "$action" = add ]; then
+        read -rsp "  New tunnel password (8–128 chars, blank = generate): " password; echo
+        [ -n "$password" ] || password=$(openssl rand -hex 12)
+        (( ${#password} >= 8 && ${#password} <= 128 )) ||
+            { err "Invalid password length."; pause; return; }
+        grep -qxF -- "$password" "$work/passwords" &&
+            { err "Password already exists."; pause; return; }
+        printf '%s\n' "$password" >> "$work/passwords"
+    else
+        zi_details
+        read -rp "  Password number to delete: " number
+        [[ "$number" =~ ^[1-9][0-9]{0,3}$ ]] && (( number <= $(wc -l < "$work/passwords") )) ||
+            { err "Invalid password number."; pause; return; }
+        [ "$(wc -l < "$work/passwords")" -gt 1 ] ||
+            { err "Cannot remove the last password. Deactivate ZIVPN instead."; pause; return; }
+        sed -i "${number}d" "$work/passwords"
+    fi
+    zi_config "$work/passwords" "$work/config.json" ||
+        { err "Could not generate config; nothing changed."; pause; return; }
+    if zi_active; then
+        active=1
+        note "Applying this change restarts ONLY ZIVPN and disconnects its current users."
+    fi
+    read -rp "  Apply password change? type YES: " answer
+    [ "$answer" = YES ] || return
+    cp -p "$ZI_DIR/config.json" "$work/previous.json" || return
+    mv "$work/config.json" "$ZI_DIR/config.json" || return
+    if [ "$active" = 1 ]; then
+        if systemctl restart zivpn.service; then restarted=1; sleep 2; fi
+        if [ "$restarted" != 1 ] || ! zi_active; then
+            if ! cp -p "$work/previous.json" "$ZI_DIR/config.json"; then
+                trap - EXIT
+                err "Cannot restore ZIVPN config. Recovery copy retained: $work/previous.json"
+                pause; return
+            fi
+            systemctl restart zivpn.service ||
+                err "Could not restore ZIVPN service. Check journalctl -u zivpn."
+            err "Change failed; previous ZIVPN password configuration restored."; pause; return
+        fi
+    fi
+    ok "ZIVPN passwords updated."; zi_details; pause
+)
+
+zi_menu() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local choice answer
+    # No concurrent menu edits; boot-time firewall locking uses a separate file.
+    exec 8>/run/lock/zivpn-panel-menu.lock
+    flock -n 8 || { err "ZIVPN is being managed in another menu."; pause; return; }
+    while :; do
+        section "Z I V P N  /  UDP TUNNEL" "$TEAL"
+        line_top "$TEAL"
+        if zi_owned && zi_active; then row "$TEAL" "${G}● ONLINE${NC}   Private UDP tunnel"
+        else row "$TEAL" "${GR}○ OFFLINE${NC}   Activate when needed"; fi
+        row "$TEAL" "UDP 6000–19999  →  5667"
+        row "$TEAL" "Isolated from SSH / HY1 / HY2 / SlowDNS"
+        line_bot "$TEAL"
+        menu_item "1" "◇" "Install / activate" "$LIME"
+        menu_item "2" "＋" "Add tunnel password" "$SKY"
+        menu_item "3" "≡" "Connection details / passwords" "$TEAL"
+        menu_item "4" "−" "Delete tunnel password" "$ORANGE"
+        menu_item "5" "○" "Deactivate ZIVPN only" "$Y"
+        menu_item "0" "↩" "Back" "$GR"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1) zi_install;;
+            2) zi_passwords add;;
+            3) zi_details; pause;;
+            4) zi_passwords delete;;
+            5)
+                zi_owned || { err "No panel-managed ZIVPN installation."; pause; continue; }
+                read -rp "  Disconnect ZIVPN users and disable on reboot? type YES: " answer
+                if [ "$answer" = YES ]; then
+                    if systemctl disable --now zivpn.service && "$ZI_FW" down; then
+                        ok "ZIVPN stopped. Passwords retained; other protocols untouched."
+                    else err "ZIVPN cleanup failed; inspect journalctl -u zivpn."; fi
+                fi
+                pause;;
+            0|"") return;;
+            *) err "Invalid option."; sleep 1;;
+        esac
+    done
+)
+
 menu_item() {  # menu_item NUM ICON "Label" color
     echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
 }
@@ -3899,11 +4463,12 @@ while true; do
     menu_item "8" "📶" "Bandwidth usage"          "$SKY"
     menu_item "9" "🌐" "Xray / V2Ray (VMess)"     "$PINK"
     menu_item "10" "🔄" "Restart all services"    "$Y"
-    menu_item "11" "🐌" "SlowDNS info"            "$PINK"
+    menu_item "11" "🐌" "SlowDNS setup / info"    "$PINK"
     menu_item "12" "🛡 " "Abuse protection"        "$LIME"
     menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
     menu_item "15" "⚡" "Hysteria 2 (UDP)"          "$LIME"
+    menu_item "16" "◇" "ZIVPN (isolated UDP)"      "$TEAL"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -3918,11 +4483,12 @@ while true; do
         8) bandwidth ;;
         9) xray_menu ;;
         10) restart_services ;;
-        11) slowdns_info ;;
+        11) slowdns_menu ;;
         12) abuse_menu ;;
         13) hysteria_menu ;;
         14) fastdns_menu ;;
         15) hy2_menu ;;
+        16) zi_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
