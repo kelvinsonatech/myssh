@@ -4063,6 +4063,354 @@ hy2_menu() {
     done
 }
 
+# ZIVPN — isolated upstream binary, data, unit and ownership-scoped firewall.
+ZI_DIR=/etc/zivpn
+ZI_BIN=/usr/local/bin/zivpn
+ZI_FW=/usr/local/bin/zivpn-panel-firewall
+ZI_UNIT=/etc/systemd/system/zivpn.service
+
+zi_owned() { [ -f "$ZI_DIR/.ssh-panel-owned" ]; }
+zi_active() { systemctl is-active --quiet zivpn.service 2>/dev/null; }
+
+zi_guard() {
+    local n line
+    # Reserve inactive HY2 custom ports too. Never edit its configuration.
+    n=$(cat /etc/hysteria2/port 2>/dev/null || true)
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n == 5667 || (n >= 6000 && n <= 19999) )); then
+        err "ZIVPN overlaps the configured Hysteria 2 port; activation refused."; return 1
+    fi
+    hy2_snapshot || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$(awk '{print $4}' <<< "$line"); n=${n##*:}
+        [[ "$n" =~ ^[0-9]+$ ]] || { err "Cannot identify a UDP listener safely."; return 1; }
+        if (( n == 5667 || (n >= 6000 && n <= 19999) )); then
+            err "UDP $n already occupied. No service was stopped."; return 1
+        fi
+    done <<< "$HY2_SS"
+    if hy2_nat_conflict 5667 5667 || hy2_nat_conflict 6000 19999 ||
+        hy2_nft_conflict 5667 5667 || hy2_nft_conflict 6000 19999; then
+        err "Existing NAT rules overlap ZIVPN; refusing to replace them."; return 1
+    fi
+    # Broad redirects and complex predicates cannot prove these ports are free.
+    # Conservatively reject them instead of guessing through arbitrary chains.
+    while IFS= read -r line; do
+        [[ "$line" == -A* ]] || continue
+        [[ "$line" == *' -p tcp '* || "$line" == *' -p icmp '* || "$line" == *' -p ipv6-icmp '* ]] && continue
+        if [[ "$line" == *' ! '* || "$line" == *'--match-set'* ||
+            ( "$line" == *' -j '* && "$line" != *'--dport '* && "$line" != *'--dports '* ) ]]; then
+            err "Unscoped NAT rule needs manual review; no firewall changes made."; return 1
+        fi
+    done <<< "$HY2_NAT4"$'\n'"$HY2_NAT6"
+    while IFS= read -r line; do
+        [[ "$line" =~ (redirect|dnat|tproxy) ]] || continue
+        [[ "$line" == *'tcp dport '* ]] && continue
+        [[ "$line" == *'udp dport '* || "$line" == *'th dport '* ]] ||
+            { err "Unscoped nft redirect needs manual review."; return 1; }
+    done <<< "$HY2_NFT"
+}
+
+zi_write_support() {
+    # Embed read-only inspectors for boot-time checks, with no menu dependency.
+    {
+        printf '#!/bin/bash\nexport PATH=/usr/local/sbin:/usr/sbin:/sbin:$PATH\n'
+        printf 'err() { echo "$*" >&2; }\n'
+        declare -f hy2_missing_tools hy2_snapshot hy2_nat_conflict hy2_nft_conflict zi_guard
+        cat <<'ZIFW'
+DIR=/etc/zivpn
+[ -f "$DIR/.ssh-panel-owned" ] || exit 1
+exec 9>/run/lock/zivpn-panel-firewall.lock
+flock -x 9 || exit 1
+input=(-p udp --dport 5667 -m comment --comment ZIVPN-PANEL-OWNED -j ACCEPT)
+cleanup() {
+    local iface result=0
+    iptables -w 5 -S INPUT >/dev/null && iptables -w 5 -t nat -S PREROUTING >/dev/null || return 1
+    while iptables -w 5 -C INPUT "${input[@]}" 2>/dev/null; do
+        iptables -w 5 -D INPUT "${input[@]}" || { result=1; break; }
+    done
+    if [ -f "$DIR/firewall-interface" ]; then
+        read -r iface < "$DIR/firewall-interface"
+        [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+        local rule=(-i "$iface" -p udp --dport 6000:19999 -m comment --comment ZIVPN-PANEL-OWNED -j DNAT --to-destination :5667)
+        while iptables -w 5 -t nat -C PREROUTING "${rule[@]}" 2>/dev/null; do
+            iptables -w 5 -t nat -D PREROUTING "${rule[@]}" || { result=1; break; }
+        done
+    fi
+    return "$result"
+}
+case "${1:-}" in
+    down) cleanup; exit $?;;
+    up)
+        cleanup || exit 1
+        zi_guard || exit 1
+        iface=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+        [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { err "No IPv4 default interface."; exit 1; }
+        printf '%s\n' "$iface" > "$DIR/firewall-interface" || exit 1
+        trap 'cleanup' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        iptables -w 5 -I INPUT 1 "${input[@]}" || exit 1
+        iptables -w 5 -t nat -A PREROUTING -i "$iface" -p udp --dport 6000:19999 \
+            -m comment --comment ZIVPN-PANEL-OWNED -j DNAT --to-destination :5667 || exit 1
+        trap - EXIT INT TERM;;
+    *) exit 2;;
+esac
+ZIFW
+    } > "$ZI_FW" || return 1
+    chmod 700 "$ZI_FW" || return 1
+    cat > "$ZI_UNIT" <<'ZIUNIT'
+[Unit]
+Description=ZIVPN UDP tunnel (isolated SSH panel service)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+WorkingDirectory=/etc/zivpn
+ExecStartPre=/usr/local/bin/zivpn-panel-firewall up
+ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
+ExecStopPost=/usr/local/bin/zivpn-panel-firewall down
+Restart=on-failure
+RestartSec=5
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+ZIUNIT
+}
+
+zi_config() {
+    # Passwords are JSON application credentials, never Linux users.
+    python3 - "$1" "$2" "$ZI_DIR" <<'ZIPY'
+import json,sys
+passwords=[p.rstrip("\n") for p in open(sys.argv[1])]
+if not passwords or any(not p or len(p)>128 for p in passwords):
+    raise SystemExit("At least one nonempty password is required.")
+if len(set(passwords)) != len(passwords):
+    raise SystemExit("Duplicate passwords are not allowed.")
+root=sys.argv[3]
+with open(sys.argv[2],"w") as f:
+    json.dump({"listen":":5667","cert":root+"/zivpn.crt","key":root+"/zivpn.key",
+               "obfs":"zivpn","auth":{"mode":"passwords","config":passwords}},f,indent=2)
+ZIPY
+}
+
+zi_start() {
+    zi_owned || { err "ZIVPN is not managed by this menu."; return 1; }
+    zi_active && return 0
+    # Remove only stale panel-owned rules; inspect again before systemd starts.
+    "$ZI_FW" down || return 1
+    zi_guard || return 1
+    if systemctl enable --now zivpn.service; then
+        sleep 2
+        if zi_active && ss -H -lunp | grep -E ':5667[[:space:]].*"zivpn"' >/dev/null; then
+            return 0
+        fi
+    fi
+    systemctl disable --now zivpn.service >/dev/null 2>&1
+    "$ZI_FW" down
+    err "ZIVPN failed to start. Other services were not restarted. See journalctl -u zivpn."
+    return 1
+}
+
+zi_install() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    umask 077
+    local work arch sha password answer tool created=0 complete=0
+    if zi_owned; then zi_start && zi_details; pause; return; fi
+    for tool in "$ZI_DIR" "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"; do
+        [ ! -e "$tool" ] || { err "Existing unmanaged ZIVPN files found: $tool. Nothing overwritten."; pause; return; }
+    done
+    if systemctl cat zivpn.service >/dev/null 2>&1; then
+        err "An existing ZIVPN service is not owned by this menu."; pause; return
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; sha=df6658c195882ff2f6cefb44050e8cb2c238ceb2b6e3fbefb931698f4f0519cb;;
+        aarch64|arm64) arch=arm64; sha=1bc3f0a46db2b4a4771dd08e68e2134c55d7c48874334ed7bba512d983bfa83a;;
+        *) err "This ZIVPN integration supports amd64 and arm64 only."; pause; return;;
+    esac
+    for tool in curl openssl python3 ip ss iptables ip6tables nft flock sha256sum; do
+        command -v "$tool" >/dev/null || {
+            err "Missing $tool. Install curl openssl python3 iproute2 iptables nftables util-linux, then retry."
+            pause; return
+        }
+    done
+    zi_guard || { pause; return; }
+    note "ZIVPN will use UDP 5667 and 6000–19999, with its own reboot-persistent rules."
+    note "No system upgrades, global buffer tuning, or other protocol restarts."
+    note "Uses the upstream closed binary. Real Android-app compatibility still needs confirmation."
+    read -rp "  Install and activate ZIVPN? type YES: " answer
+    [ "$answer" = YES ] || return
+    read -rsp "  First tunnel password (8–128 characters, blank = generate): " password; echo
+    [ -n "$password" ] || password=$(openssl rand -hex 12)
+    (( ${#password} >= 8 && ${#password} <= 128 )) ||
+        { err "Password must be 8–128 characters."; pause; return; }
+    work=$(mktemp -d) || return
+    trap 'if [ "$created" = 1 ] && [ "$complete" = 0 ]; then
+        rm -f "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"
+        rm -rf "$ZI_DIR"
+        systemctl daemon-reload >/dev/null 2>&1
+    fi; rm -rf "$work"' EXIT
+    note "Downloading and verifying upstream ZIVPN..."
+    curl -fL --retry 2 --connect-timeout 20 --max-time 120 \
+        "https://github.com/zahidbd2/udp-zivpn/releases/download/udp-zivpn_1.4.9/udp-zivpn-linux-$arch" \
+        -o "$work/zivpn" ||
+        { err "Download failed; no service changed."; pause; return; }
+    printf '%s  %s\n' "$sha" "$work/zivpn" | sha256sum -c --status ||
+        { err "Binary checksum mismatch. Installation refused."; pause; return; }
+    chmod 700 "$work/zivpn"
+    "$work/zivpn" -h > "$work/version" 2>&1 && grep -qi zivpn "$work/version" ||
+        { err "ZIVPN binary cannot run on this server."; pause; return; }
+    openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 -subj '/CN=zivpn' \
+        -keyout "$work/zivpn.key" -out "$work/zivpn.crt" >/dev/null 2>&1 ||
+        { err "Certificate generation failed."; pause; return; }
+    printf '%s\n' "$password" > "$work/passwords"
+    zi_config "$work/passwords" "$work/config.json" || { pause; return; }
+    zi_guard || { pause; return; }
+    # All downloading and configuration generation finish before service changes.
+    mkdir -m 700 "$ZI_DIR" || return
+    created=1
+    touch "$ZI_DIR/.ssh-panel-owned"
+    install -m 755 "$work/zivpn" "$ZI_BIN" &&
+        install -m 600 "$work/config.json" "$work/zivpn.key" "$work/zivpn.crt" "$ZI_DIR/" &&
+        zi_write_support && systemctl daemon-reload ||
+        { err "ZIVPN setup failed; incomplete ZIVPN files will be removed. Other protocols untouched."; pause; return; }
+    complete=1
+    if zi_start; then ok "ZIVPN activated. Open the ZIVPN Android app with the details below."; zi_details; fi
+    pause
+)
+
+zi_details() {
+    zi_owned || { note "Not installed. Choose Install / activate."; return; }
+    line_top "$TEAL"
+    if zi_active; then row "$TEAL" "${G}Currently activated${NC}"
+    else row "$TEAL" "${Y}Currently inactive${NC}"; fi
+    row "$TEAL" "Server IPv4: ${SERVER_IP:-not configured}"
+    row "$TEAL" "Client UDP ports: 6000–19999"
+    row "$TEAL" "Server listener: 5667 / UDP"
+    row "$TEAL" "Client: ZIVPN Android (password only)"
+    if systemctl is-enabled --quiet zivpn.service 2>/dev/null; then
+        row "$TEAL" "Reboot: automatic startup enabled"
+    else row "$TEAL" "Reboot: automatic startup disabled"; fi
+    line_bot "$TEAL"
+    note "Passwords are private. No Linux username or SNI is required."
+    python3 - "$ZI_DIR/config.json" <<'ZIPASSWORDS'
+import json,sys
+try:
+    config=json.load(open(sys.argv[1]))
+    for i,password in enumerate(config["auth"]["config"],1):
+        print(f"  Password {i}: {password}")
+except (OSError,ValueError,KeyError,TypeError) as e:
+    raise SystemExit(f"Cannot read ZIVPN passwords: {e}")
+ZIPASSWORDS
+    note "No automatic expiry is configured. Deletion/restart disconnects ZIVPN sessions."
+    note "Self-signed TLS; allow UDP 6000–19999 in your provider firewall."
+}
+
+zi_passwords() (
+    umask 077
+    local action="$1" work password number answer active=0 restarted=0
+    zi_owned || { err "Install ZIVPN first."; pause; return; }
+    work=$(mktemp -d "$ZI_DIR/.edit.XXXXXX") || return
+    trap 'rm -rf "$work"' EXIT
+    python3 - "$ZI_DIR/config.json" "$work/passwords" <<'ZILIST'
+import json,sys
+data=json.load(open(sys.argv[1]))
+with open(sys.argv[2],"w") as f:
+    f.write("".join(p+"\n" for p in data["auth"]["config"]))
+ZILIST
+    [ "$?" = 0 ] || { err "Invalid existing config; nothing changed."; pause; return; }
+    if [ "$action" = add ]; then
+        read -rsp "  New tunnel password (8–128 chars, blank = generate): " password; echo
+        [ -n "$password" ] || password=$(openssl rand -hex 12)
+        (( ${#password} >= 8 && ${#password} <= 128 )) ||
+            { err "Invalid password length."; pause; return; }
+        grep -qxF -- "$password" "$work/passwords" &&
+            { err "Password already exists."; pause; return; }
+        printf '%s\n' "$password" >> "$work/passwords"
+    else
+        zi_details
+        read -rp "  Password number to delete: " number
+        [[ "$number" =~ ^[1-9][0-9]{0,3}$ ]] && (( number <= $(wc -l < "$work/passwords") )) ||
+            { err "Invalid password number."; pause; return; }
+        [ "$(wc -l < "$work/passwords")" -gt 1 ] ||
+            { err "Cannot remove the last password. Deactivate ZIVPN instead."; pause; return; }
+        sed -i "${number}d" "$work/passwords"
+    fi
+    zi_config "$work/passwords" "$work/config.json" ||
+        { err "Could not generate config; nothing changed."; pause; return; }
+    if zi_active; then
+        active=1
+        note "Applying this change restarts ONLY ZIVPN and disconnects its current users."
+    fi
+    read -rp "  Apply password change? type YES: " answer
+    [ "$answer" = YES ] || return
+    cp -p "$ZI_DIR/config.json" "$work/previous.json" || return
+    mv "$work/config.json" "$ZI_DIR/config.json" || return
+    if [ "$active" = 1 ]; then
+        if systemctl restart zivpn.service; then restarted=1; sleep 2; fi
+        if [ "$restarted" != 1 ] || ! zi_active; then
+            if ! cp -p "$work/previous.json" "$ZI_DIR/config.json"; then
+                trap - EXIT
+                err "Cannot restore ZIVPN config. Recovery copy retained: $work/previous.json"
+                pause; return
+            fi
+            systemctl restart zivpn.service ||
+                err "Could not restore ZIVPN service. Check journalctl -u zivpn."
+            err "Change failed; previous ZIVPN password configuration restored."; pause; return
+        fi
+    fi
+    ok "ZIVPN passwords updated."; zi_details; pause
+)
+
+zi_menu() (
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    local choice answer
+    # No concurrent menu edits; boot-time firewall locking uses a separate file.
+    exec 8>/run/lock/zivpn-panel-menu.lock
+    flock -n 8 || { err "ZIVPN is being managed in another menu."; pause; return; }
+    while :; do
+        section "Z I V P N  /  UDP TUNNEL" "$TEAL"
+        line_top "$TEAL"
+        if zi_owned && zi_active; then row "$TEAL" "${G}● ONLINE${NC}   Private UDP tunnel"
+        else row "$TEAL" "${GR}○ OFFLINE${NC}   Activate when needed"; fi
+        row "$TEAL" "UDP 6000–19999  →  5667"
+        row "$TEAL" "Isolated from SSH / HY1 / HY2 / SlowDNS"
+        line_bot "$TEAL"
+        menu_item "1" "◇" "Install / activate" "$LIME"
+        menu_item "2" "＋" "Add tunnel password" "$SKY"
+        menu_item "3" "≡" "Connection details / passwords" "$TEAL"
+        menu_item "4" "−" "Delete tunnel password" "$ORANGE"
+        menu_item "5" "○" "Deactivate ZIVPN only" "$Y"
+        menu_item "0" "↩" "Back" "$GR"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1) zi_install;;
+            2) zi_passwords add;;
+            3) zi_details; pause;;
+            4) zi_passwords delete;;
+            5)
+                zi_owned || { err "No panel-managed ZIVPN installation."; pause; continue; }
+                read -rp "  Disconnect ZIVPN users and disable on reboot? type YES: " answer
+                if [ "$answer" = YES ]; then
+                    if systemctl disable --now zivpn.service && "$ZI_FW" down; then
+                        ok "ZIVPN stopped. Passwords retained; other protocols untouched."
+                    else err "ZIVPN cleanup failed; inspect journalctl -u zivpn."; fi
+                fi
+                pause;;
+            0|"") return;;
+            *) err "Invalid option."; sleep 1;;
+        esac
+    done
+)
+
 menu_item() {  # menu_item NUM ICON "Label" color
     echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
 }
@@ -4086,6 +4434,7 @@ while true; do
     menu_item "13" "⚡" "UDP (Hysteria) high-speed" "$SKY"
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
     menu_item "15" "⚡" "Hysteria 2 (UDP)"          "$LIME"
+    menu_item "16" "◇" "ZIVPN (isolated UDP)"      "$TEAL"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -4105,6 +4454,7 @@ while true; do
         13) hysteria_menu ;;
         14) fastdns_menu ;;
         15) hy2_menu ;;
+        16) zi_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
