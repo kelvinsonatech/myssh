@@ -6,4 +6,4 @@
 - [Hysteria UDP tunnel](hysteria-udp.md) — menu 13; user:pass auth, obfs, port-hop UDP 20000-50000→36712; UDP-only so can't break TCP protocols; NOT for zero-data/payload.
 - [SlowDNS isolation](slowdns-udp53.md) — submenu-only, private Go; protect working protocols, preserve DNS, never kill unknown UDP 53 owners.
 - [Hysteria 2 coexistence](hysteria2-isolation.md) — isolate from HY1; UDP 53 handover requires confirmation and restoration, including installer/restart paths.
-- [ZIVPN isolation](zivpn-isolation.md) — actual upstream binary only; protect other protocols, real Android-client proof still required.
+- [ZIVPN isolation](zivpn-isolation.md) — actual upstream binary; user confirmed working; preserve protocol isolation and concise details.

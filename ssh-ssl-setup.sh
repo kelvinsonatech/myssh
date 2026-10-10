@@ -4256,6 +4256,14 @@ zi_prepare_tools() {
         { err "Still missing:$missing. ZIVPN activation stopped safely."; return 1; }
 }
 
+zi_prompt_password() {
+    IFS= read -rsp "  Tunnel password (Enter = zipox): " password || return 1
+    echo
+    password=${password:-zipox}
+    (( ${#password} <= 128 )) ||
+        { err "Password must be 1–128 characters."; return 1; }
+}
+
 zi_install() (
     export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
     umask 077
@@ -4278,14 +4286,9 @@ zi_install() (
     zi_prepare_tools || { pause; return; }
     zi_guard || { pause; return; }
     note "ZIVPN will use UDP 5667 and 6000–19999, with its own reboot-persistent rules."
-    note "No system upgrades, global buffer tuning, or other protocol restarts."
-    note "Uses the upstream closed binary. Real Android-app compatibility still needs confirmation."
     read -rp "  Install and activate ZIVPN? type YES: " answer
     [ "$answer" = YES ] || return
-    read -rsp "  First tunnel password (8–128 characters, blank = generate): " password; echo
-    [ -n "$password" ] || password=$(openssl rand -hex 12)
-    (( ${#password} >= 8 && ${#password} <= 128 )) ||
-        { err "Password must be 8–128 characters."; pause; return; }
+    zi_prompt_password || { pause; return; }
     work=$(mktemp -d) || return
     trap 'if [ "$created" = 1 ] && [ "$complete" = 0 ]; then
         rm -f "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"
@@ -4323,29 +4326,26 @@ zi_install() (
 
 zi_details() {
     zi_owned || { note "Not installed. Choose Install / activate."; return; }
+    section "Z I V P N  /  CONNECTION DETAILS" "$TEAL"
     line_top "$TEAL"
-    if zi_active; then row "$TEAL" "${G}Currently activated${NC}"
-    else row "$TEAL" "${Y}Currently inactive${NC}"; fi
-    row "$TEAL" "Server IPv4: ${SERVER_IP:-not configured}"
-    row "$TEAL" "Client UDP ports: 6000–19999"
-    row "$TEAL" "Server listener: 5667 / UDP"
-    row "$TEAL" "Client: ZIVPN Android (password only)"
-    if systemctl is-enabled --quiet zivpn.service 2>/dev/null; then
-        row "$TEAL" "Reboot: automatic startup enabled"
-    else row "$TEAL" "Reboot: automatic startup disabled"; fi
+    if zi_active; then row "$TEAL" "${G}● Currently activated${NC}"
+    else row "$TEAL" "${Y}○ Currently inactive${NC}"; fi
+    line_mid "$TEAL"
+    row "$TEAL" "SERVER    ${SERVER_IP:-not configured}"
+    row "$TEAL" "UDP PORTS 6000–19999"
+    row "$TEAL" "APP       ZIVPN"
     line_bot "$TEAL"
-    note "Passwords are private. No Linux username or SNI is required."
-    python3 - "$ZI_DIR/config.json" <<'ZIPASSWORDS'
+    printf '\n'
+    python3 - "$ZI_DIR/config.json" "$TEAL" "$NC" <<'ZIPASSWORDS'
 import json,sys
 try:
     config=json.load(open(sys.argv[1]))
     for i,password in enumerate(config["auth"]["config"],1):
-        print(f"  Password {i}: {password}")
+        print(f"  PASSWORD {i}")
+        print(f"  {sys.argv[2]}{password}{sys.argv[3]}\n")
 except (OSError,ValueError,KeyError,TypeError) as e:
     raise SystemExit(f"Cannot read ZIVPN passwords: {e}")
 ZIPASSWORDS
-    note "No automatic expiry is configured. Deletion/restart disconnects ZIVPN sessions."
-    note "Self-signed TLS; allow UDP 6000–19999 in your provider firewall."
 }
 
 zi_passwords() (
@@ -4362,10 +4362,7 @@ with open(sys.argv[2],"w") as f:
 ZILIST
     [ "$?" = 0 ] || { err "Invalid existing config; nothing changed."; pause; return; }
     if [ "$action" = add ]; then
-        read -rsp "  New tunnel password (8–128 chars, blank = generate): " password; echo
-        [ -n "$password" ] || password=$(openssl rand -hex 12)
-        (( ${#password} >= 8 && ${#password} <= 128 )) ||
-            { err "Invalid password length."; pause; return; }
+        zi_prompt_password || { pause; return; }
         grep -qxF -- "$password" "$work/passwords" &&
             { err "Password already exists."; pause; return; }
         printf '%s\n' "$password" >> "$work/passwords"
@@ -4416,7 +4413,6 @@ zi_menu() (
         if zi_owned && zi_active; then row "$TEAL" "${G}● ONLINE${NC}   Private UDP tunnel"
         else row "$TEAL" "${GR}○ OFFLINE${NC}   Activate when needed"; fi
         row "$TEAL" "UDP 6000–19999  →  5667"
-        row "$TEAL" "Isolated from SSH / HY1 / HY2 / SlowDNS"
         line_bot "$TEAL"
         menu_item "1" "◇" "Install / activate" "$LIME"
         menu_item "2" "＋" "Add tunnel password" "$SKY"

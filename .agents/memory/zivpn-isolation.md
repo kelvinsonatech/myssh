@@ -24,8 +24,9 @@ based solely on the banner would prevent the user-requested implementation.
 
 **How to apply:** verify the pinned archive asset fingerprint and use `-h` for
 the executable smoke check. A local startup/binding check is not proof of Android
-authentication or internet traffic. Do not claim app compatibility until a real
-ZIVPN client passes. The binary is closed; a pinned hash is not a source audit
+authentication or internet traffic. The user confirmed this upstream-binary
+ZIVPN integration works on 2026-10-10; this is user confirmation, not an
+agent-run Android test. The binary is closed; a pinned hash is not a source audit
 or a publisher signature.
 
 Passwords are application credentials, not Linux accounts. Do not infer account
@@ -34,3 +35,14 @@ expiry support from having a date field in a menu.
 **Why:** password reload/disconnect semantics must be established first. For now
 changes require an explicitly confirmed ZIVPN-only restart, with no auto-expiry
 claim and no restart of other services.
+
+Keep ZIVPN details concise and readable; omit the isolation-from-other-protocols
+caption. Blank password input should use the user-chosen fixed default rather
+than generate random credentials, while still accepting custom input. Do not
+change existing credentials when adjusting this default.
+
+**Why:** the user explicitly requested these presentation/default changes after
+confirming the integration works.
+
+**How to apply:** limit such changes to ZIVPN prompts and presentation; retain
+port guards, firewall ownership and existing protocol settings.
