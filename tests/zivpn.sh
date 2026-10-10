@@ -22,6 +22,36 @@ pause() { :; }
 note() { :; }
 ok() { :; }
 zi_details() { :; }
+# Dependency checks/installations are mocked: never run apt on this machine.
+(
+    ready=0; calls=0; apt_fail=0; stays_missing=0
+    command() {
+        if [[ "$1" = -v ]]; then
+            case "$2" in
+                iptables|ip6tables) [ "$ready" = 1 ]; return;;
+                *) return 0;;
+            esac
+        fi
+        builtin command "$@"
+    }
+    apt-get() {
+        calls=$((calls + 1))
+        [ "$*" = "install -y --no-upgrade --no-remove --no-install-recommends iptables" ] || return 9
+        [ "$DEBIAN_FRONTEND" = noninteractive ] && [ "$NEEDRESTART_MODE" = l ] || return 9
+        [ "$apt_fail" = 0 ] || return 1
+        [ "$stays_missing" = 1 ] || ready=1
+        return 0
+    }
+    zi_prepare_tools
+    [ "$calls" = 1 ] && [ "$ready" = 1 ]
+    zi_prepare_tools
+    [ "$calls" = 1 ] # Already available: no apt invocation.
+    ready=0; apt_fail=1
+    if zi_prepare_tools 2>/dev/null; then exit 1; fi
+    apt_fail=0; stays_missing=1
+    if zi_prepare_tools 2>/dev/null; then exit 1; fi
+)
+echo "PASS: missing iptables auto-install, deduplication, no-op, apt failure and post-install checks"
 ss() {
     [ "${SS_FAIL:-0}" = 0 ] || return 1
     printf '%s\n' "${LISTENERS:-}"

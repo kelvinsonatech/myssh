@@ -4220,11 +4220,50 @@ zi_start() {
     return 1
 }
 
+zi_prepare_tools() {
+    local tool package missing=""
+    local -a tools=(curl openssl python3 ip ss iptables ip6tables nft flock sha256sum)
+    local -a packages=()
+    export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+    for tool in "${tools[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 && continue
+        case "$tool" in
+            ip|ss) package=iproute2;;
+            iptables|ip6tables) package=iptables;;
+            nft) package=nftables;;
+            flock) package=util-linux;;
+            sha256sum) package=coreutils;;
+            *) package="$tool";;
+        esac
+        [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    [ "${#packages[@]}" = 0 ] && return 0
+    command -v apt-get >/dev/null 2>&1 ||
+        { err "Missing tools require Debian/Ubuntu apt-get: ${packages[*]}"; return 1; }
+    note "Preparing ZIVPN prerequisites: ${packages[*]}"
+    # Tool packages only; never install a firewall manager/persistence package,
+    # upgrade the system, change alternatives, or flush/replace existing rules.
+    if ! DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y \
+        --no-upgrade --no-remove --no-install-recommends "${packages[@]}"; then
+        err "Prerequisite installation failed. Review apt output above; ZIVPN was not activated."
+        return 1
+    fi
+    hash -r
+    for tool in "${tools[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=" $tool"
+    done
+    [ -z "$missing" ] ||
+        { err "Still missing:$missing. ZIVPN activation stopped safely."; return 1; }
+}
+
 zi_install() (
     export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
     umask 077
     local work arch sha password answer tool created=0 complete=0
-    if zi_owned; then zi_start && zi_details; pause; return; fi
+    if zi_owned; then
+        zi_prepare_tools && zi_start && zi_details
+        pause; return
+    fi
     for tool in "$ZI_DIR" "$ZI_BIN" "$ZI_FW" "$ZI_UNIT"; do
         [ ! -e "$tool" ] || { err "Existing unmanaged ZIVPN files found: $tool. Nothing overwritten."; pause; return; }
     done
@@ -4236,12 +4275,7 @@ zi_install() (
         aarch64|arm64) arch=arm64; sha=1bc3f0a46db2b4a4771dd08e68e2134c55d7c48874334ed7bba512d983bfa83a;;
         *) err "This ZIVPN integration supports amd64 and arm64 only."; pause; return;;
     esac
-    for tool in curl openssl python3 ip ss iptables ip6tables nft flock sha256sum; do
-        command -v "$tool" >/dev/null || {
-            err "Missing $tool. Install curl openssl python3 iproute2 iptables nftables util-linux, then retry."
-            pause; return
-        }
-    done
+    zi_prepare_tools || { pause; return; }
     zi_guard || { pause; return; }
     note "ZIVPN will use UDP 5667 and 6000–19999, with its own reboot-persistent rules."
     note "No system upgrades, global buffer tuning, or other protocol restarts."
