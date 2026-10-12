@@ -21,7 +21,19 @@ err() { echo "$*" >&2; }
 pause() { :; }
 note() { :; }
 ok() { :; }
+eval "$(declare -f zi_details | sed '1s/zi_details/zi_render_details/')"
 zi_details() { :; }
+(
+    password=""
+    zi_prompt_password <<< "" >/dev/null
+    [ "$password" = zipox ]
+    zi_prompt_password <<< 'my custom\password' >/dev/null
+    [ "$password" = 'my custom\password' ]
+    if zi_prompt_password </dev/null >/dev/null; then exit 1; fi
+    long=$(printf '%129s' x)
+    if zi_prompt_password <<< "$long" >/dev/null 2>&1; then exit 1; fi
+)
+echo "PASS: default/custom passwords, EOF cancellation and length validation"
 # Dependency checks/installations are mocked: never run apt on this machine.
 (
     ready=0; calls=0; apt_fail=0; stays_missing=0
@@ -92,6 +104,26 @@ reject zi_config "$tmp/passwords" "$tmp/empty.json"
 printf 'duplicatepass\nduplicatepass\n' > "$tmp/passwords"
 reject zi_config "$tmp/passwords" "$tmp/duplicate.json"
 touch "$ZI_DIR/.ssh-panel-owned"
+(
+    TEAL=""; NC=""; G=""; Y=""; SERVER_IP=192.0.2.1
+    section() { printf '%s\n' "$1"; }
+    row() { printf '%s\n' "$2"; }
+    line_top() { :; }; line_mid() { :; }; line_bot() { :; }
+    zi_active() { return 0; }
+    cp "$ZI_DIR/config.json" "$tmp/details-before.json"
+    zi_render_details > "$tmp/details"
+    grep -q "Currently activated" "$tmp/details"
+    grep -q "192.0.2.1" "$tmp/details"
+    grep -q "6000–19999" "$tmp/details"
+    grep -q "PASSWORD 1" "$tmp/details"
+    grep -qF 'password "quoted"\test' "$tmp/details"
+    ! grep -Eq 'Isolated|Reboot|expiry|Self-signed|listener' "$tmp/details"
+    zi_active() { return 1; }
+    zi_render_details > "$tmp/details"
+    grep -q "Currently inactive" "$tmp/details"
+    cmp "$ZI_DIR/config.json" "$tmp/details-before.json"
+)
+echo "PASS: concise active/inactive connection details preserve existing passwords"
 zi_write_support
 bash -n "$ZI_FW"
 grep -q '^ExecStartPre=/usr/local/bin/zivpn-panel-firewall up$' "$ZI_UNIT"
