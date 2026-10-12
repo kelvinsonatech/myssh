@@ -1,0 +1,52 @@
+root@localhost:~# sudo sh -c 'ls -t /var/log/slowdns-install.*.log | head -1 | xargs -r tail -n 100'
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100    75  100    75    0     0    206      0 --:--:-- --:--:-- --:--:--   207
+100 67.2M  100 67.2M    0     0  96.9M      0 --:--:-- --:--:-- --:--:-- 96.9M
+/tmp/slowdns-install.sL7Bb9/go.tgz: OK
+Cloning into '/tmp/slowdns-install.sL7Bb9/source'...
+go: downloading golang.org/x/crypto v0.31.0
+go: downloading golang.org/x/text v0.21.0
+go: downloading golang.org/x/sys v0.28.0
+go: downloading golang.org/x/net v0.33.0
+go: upgraded golang.org/x/crypto v0.21.0 => v0.31.0
+go: upgraded golang.org/x/net v0.23.0 => v0.33.0
+go: upgraded golang.org/x/sys v0.18.0 => v0.28.0
+go: upgraded golang.org/x/text v0.14.0 => v0.21.0
+go: downloading github.com/xtaci/kcp-go/v5 v5.6.8
+go: downloading github.com/xtaci/smux v1.5.24
+go: downloading github.com/flynn/noise v1.0.0
+go: downloading github.com/klauspost/reedsolomon v1.12.0
+go: downloading github.com/pkg/errors v0.9.1
+go: downloading github.com/templexxx/xorsimd v0.4.2
+go: downloading github.com/tjfoc/gmsm v1.4.1
+go: downloading github.com/templexxx/cpu v0.1.0
+go: downloading github.com/klauspost/cpuid/v2 v2.2.6
+Usage:
+  /tmp/slowdns-install.sL7Bb9/dnstt-server -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
+  /tmp/slowdns-install.sL7Bb9/dnstt-server -udp ADDR -privkey-file PRIVKEYFILE DOMAIN UPSTREAMADDR
+
+Example:
+  /tmp/slowdns-install.sL7Bb9/dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
+  /tmp/slowdns-install.sL7Bb9/dnstt-server -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+
+  -gen-key
+        generate a server keypair; print to stdout or save to files
+  -mtu int
+        maximum size of DNS responses (default 1232)
+  -privkey string
+        server private key (64 hex digits)
+  -privkey-file string
+        read server private key from file (with -gen-key, write to file)
+  -pubkey-file string
+        with -gen-key, write server public key to file
+  -udp string
+        UDP address to listen on (required)
+privkey written to /tmp/slowdns-install.sL7Bb9/server.key
+pubkey  written to /tmp/slowdns-install.sL7Bb9/server.pub
+Failed to get unit file state for slowdns.service: No such file or directory
+Resolved still occupies UDP 53.
+Failed to stop slowdns.service: Unit slowdns.service not loaded.
+Failed to disable unit: Unit file slowdns.service does not exist.
+SlowDNS activation failed; prior files restored. Review this log for restore errors.
+root@localhost:~#
