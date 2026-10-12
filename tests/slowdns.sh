@@ -65,6 +65,20 @@ systemctl() {
         'is-enabled --quiet slowdns.service') return 1;;
         'enable --now slowdns.service') [ "${START_FAIL:-0}" = 0 ] || return 1; SD_STARTED=1;;
         'stop slowdns.service') SD_STARTED=0;;
+        'restart systemd-resolved.service')
+            local dir="$tmp/etc/systemd/resolved.conf.d"
+            local conf="$dir/zz-ssh-panel-slowdns.conf"
+            # Model the non-root daemon: inaccessible configuration leaves the
+            # default stub enabled, even though restarting the service succeeds.
+            HY2_SS='UNCONN 0 0 127.0.0.53:53 0.0.0.0:* users:(("systemd-resolve",pid=8,fd=2))'
+            if [ -f "$conf" ] &&
+                (( (8#$(stat -c %a "$dir") & 5) == 5 )) &&
+                (( (8#$(stat -c %a "$conf") & 4) == 4 )) &&
+                grep -qx 'DNSStubListener=no' "$conf"; then
+                HY2_SS=""
+                echo resolver-released >> "$tmp/service-calls"
+            fi
+            return 0;;
         *) return 0;;
     esac
 }
@@ -105,14 +119,38 @@ START_FAIL=1 reject slowdns_deploy
 [ "$(readlink "$tmp/etc/resolv.conf")" = "$tmp/stub.conf" ]
 # A resolved stub adjustment must roll back if activation fails.
 HY2_SS='UNCONN 0 0 127.0.0.53:53 0.0.0.0:* users:(("systemd-resolve",pid=8,fd=2))'
-RESOLVED_ACTIVE=1 START_FAIL=1 reject slowdns_deploy
+(umask 077; RESOLVED_ACTIVE=1 START_FAIL=1 reject slowdns_deploy)
 [ "$(readlink "$tmp/etc/resolv.conf")" = "$tmp/stub.conf" ]
 [ ! -e "$tmp/etc/systemd/resolved.conf.d/zz-ssh-panel-slowdns.conf" ]
+grep -q resolver-released "$tmp/service-calls"
+[ ! -d "$tmp/etc/systemd/resolved.conf.d" ]
+# Existing directory and drop-in modes/content must be restored after failure.
+mkdir -m 700 "$tmp/etc/systemd/resolved.conf.d"
+dropin="$tmp/etc/systemd/resolved.conf.d/zz-ssh-panel-slowdns.conf"
+printf '[Resolve]\nDNSStubListener=yes\n' > "$dropin"
+chmod 600 "$dropin"
+(umask 077; RESOLVED_ACTIVE=1 START_FAIL=1 reject slowdns_deploy)
+[ "$(stat -c %a "${dropin%/*}")" = 700 ]
+[ "$(stat -c %a "$dropin")" = 600 ]
+grep -qx 'DNSStubListener=yes' "$dropin"
+[ "$(readlink "$tmp/etc/resolv.conf")" = "$tmp/stub.conf" ]
+rm "$dropin"
+# Activation under the real installer umask: repair an existing 700 directory,
+# and also handle a new directory. No unrelated resolver file is modified.
+for fixture in existing new; do
+    if [ "$fixture" = new ]; then rmdir "${dropin%/*}"; fi
+    (umask 077; RESOLVED_ACTIVE=1 slowdns_deploy)
+    [ "$(stat -c %a "${dropin%/*}")" = 755 ]
+    [ "$(stat -c %a "$dropin")" = 644 ]
+    [ "$(stat -c %a "$tmp/etc/slowdns/server.key")" = 600 ]
+    [ "$(readlink "$tmp/etc/resolv.conf")" = "$tmp/run/systemd/resolve/resolv.conf" ]
+    rm "$dropin"
+done
 HY2_SS=""
 slowdns_deploy
 [ "$(cat "$CONF_DIR/nsdomain.conf")" = dns.example.com ]
 grep -q 'dns.example.com 127.0.0.1:22' "$tmp/etc/systemd/system/slowdns.service"
-if grep -E '^(stop|restart|disable|enable --now) (hysteria|xray|ssh|stunnel|dropbear|ws-proxy)' "$tmp/service-calls"; then
+if grep -E '^(stop|restart|disable|enable --now) (zivpn|hysteria|xray|ssh|stunnel|dropbear|ws-proxy)' "$tmp/service-calls"; then
     echo "Touched another protocol"; exit 1
 fi
 echo "PASS: Go version/ecdh, checksum failure, port refusal, rollback, and isolated deployment"
