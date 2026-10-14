@@ -12,6 +12,8 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
+import urllib.request
 
 from .common import account_lock, atomic, write_json
 
@@ -19,6 +21,41 @@ CONFIG = Path("/etc/vpn-node-api/config.json")
 HOME = Path("/opt/vpn-node-api")
 UNIT = Path("/etc/systemd/system/vpn-node-api.service")
 FIREWALL = "VPN_NODE_API"
+STEP = "Checking API prerequisites"
+PIP_URL = ("https://files.pythonhosted.org/packages/ef/7d/"
+           "500c9ad20238fcfcb4cb9243eede163594d7020ce87bd9610c9e02771876/"
+           "pip-24.3.1-py3-none-any.whl")
+PIP_SHA256 = "3790624780082365f47549d032f3770eeb2b1e8bd1f7b2e02dace1afa361b4ed"
+
+
+def stage(message):
+    global STEP
+    STEP = message
+    print("  → " + message, flush=True)
+
+
+def install_dependencies(destination):
+    """Use a verified temporary pip without installing or changing system pip."""
+    stage("Preparing private API dependencies")
+    with tempfile.TemporaryDirectory(prefix="vpn-node-pip-") as temporary:
+        env = dict(os.environ)
+        try:
+            run([sys.executable, "-m", "pip", "--version"])
+        except subprocess.CalledProcessError:
+            print("  System pip unavailable; using a verified private installer.", flush=True)
+            wheel = Path(temporary) / "pip.whl"
+            with urllib.request.urlopen(PIP_URL, timeout=45) as response:
+                content = response.read(4 * 1024 * 1024 + 1)
+            if hashlib.sha256(content).hexdigest() != PIP_SHA256:
+                raise ValueError("Private pip checksum failed; nothing installed")
+            wheel.write_bytes(content)
+            # Python can import directly from this wheel. No apt, get-pip
+            # execution, global pip upgrade, or distro service hooks.
+            env["PYTHONPATH"] = str(wheel)
+        run([sys.executable, "-m", "pip", "--isolated", "install",
+             "--disable-pip-version-check", "--no-warn-script-location",
+             "--no-cache-dir", "--only-binary=:all:", "--target", str(destination),
+             "fastapi==0.115.12", "uvicorn==0.34.3"], env=env, timeout=240)
 
 MENU_LOCK = """
 # Shared serialization for menu writes and website writes; no daemon restart.
@@ -203,6 +240,7 @@ WantedBy=multi-user.target
 
 
 def install():
+    stage("Checking API prerequisites")
     if CONFIG.exists() or UNIT.exists() or HOME.exists():
         raise ValueError("API files already exist; use status, or review the previous installation")
     if sys.version_info < (3, 9):
@@ -210,7 +248,6 @@ def install():
     for name in ("openssl", "iptables", "ip6tables", "nft", "ss", "systemctl"):
         if not shutil.which(name):
             raise ValueError(f"Missing {name}; install prerequisites before API setup")
-    run([sys.executable, "-m", "pip", "--version"])
     menu_path = Path("/usr/local/bin/menu")
     menu_before = menu_path.read_text()
     menu_after = coordinated_menu(menu_before)
@@ -221,17 +258,22 @@ def install():
     ip = str(ipaddress.IPv4Address(input("Server public IPv4: ").strip()))
     website = str(ipaddress.IPv4Address(input("Website outgoing IPv4 (only this IP may call API): ").strip()))
     port = int(input("API TCP port [9443]: ").strip() or "9443")
+    stage("Checking TCP port and existing firewall rules")
     guard = require_safe_port(port)
     cfg = {"hostname": host, "public_ip": ip, "port": port, "website_ips": [website],
            "key_id": "node-" + secrets.token_hex(4), "secret": secrets.token_hex(32)}
     try:
-        HOME.mkdir(mode=0o700)
+        # Complete the fallible network/package step before creating permanent
+        # API files. A failed download can be retried without deleting anything.
+        with tempfile.TemporaryDirectory(prefix="vpn-node-build-") as temporary:
+            deps = Path(temporary) / "deps"
+            install_dependencies(deps)
+            stage("Installing isolated API files")
+            HOME.mkdir(mode=0o700)
+            shutil.copytree(deps, HOME / "deps")
         shutil.copytree(Path(__file__).parent, HOME / "vpn_node_api",
                         ignore=shutil.ignore_patterns("__pycache__"))
-        # Isolated target directory; never uninstall/upgrade system packages.
-        run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-             "--no-warn-script-location", "--target", str(HOME / "deps"),
-             "fastapi==0.115.12", "uvicorn==0.34.3"], timeout=240)
+        stage("Preparing HTTPS certificate")
         CONFIG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(CONFIG.parent, 0o700)
         cert, key = CONFIG.parent / "server.crt", CONFIG.parent / "server.key"
@@ -272,8 +314,10 @@ def install():
         # Versioned backup; preserve terminal menu behavior apart from locking.
         atomic(CONFIG.parent / "menu.before-api", menu_before, 0o700)
         atomic(menu_path, menu_after, 0o755)
+        stage("Allowing the website IP on the API TCP port only")
         firewall_up(cfg)
         guard.close()
+        stage("Starting the API service only")
         run(["systemctl", "daemon-reload"])
         run(["systemctl", "enable", "--now", "vpn-node-api.service"], timeout=25)
         import time
@@ -358,7 +402,16 @@ def main():
             print("API disabled. All VPN protocols and account data retained.")
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         # Subprocess exceptions can contain command arguments: never print them.
-        message = str(error) if isinstance(error, ValueError) else "Operation failed; check API service status"
+        if isinstance(error, ValueError):
+            message = str(error)
+        elif isinstance(error, subprocess.CalledProcessError):
+            message = f"{STEP}: command exited with status {error.returncode}."
+        elif isinstance(error, subprocess.TimeoutExpired):
+            message = f"{STEP}: operation timed out. Check network access and retry."
+        elif isinstance(error, FileNotFoundError):
+            message = f"{STEP}: required file or program is missing."
+        else:
+            message = f"{STEP}: network, certificate, permission or filesystem failure ({type(error).__name__})."
         raise SystemExit(message)
 
 

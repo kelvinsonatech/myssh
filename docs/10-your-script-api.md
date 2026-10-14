@@ -31,10 +31,14 @@ On a **test VPS first**, with the repository checked out:
 sudo bash scripts/node-api/install.sh
 ```
 
-Requires Python 3.9+, pip, curl, OpenSSL, systemd, iproute2, iptables/ip6tables and
+Requires Python 3.9+, curl, OpenSSL, systemd, iproute2, iptables/ip6tables and
 nftables. The installer does not replace system Python or install distro
 packages (package hooks could restart services). Dependencies go in a private
 `/opt/vpn-node-api/deps` target directory, not system site-packages.
+If system pip is absent, setup downloads a SHA-256-pinned pip wheel and uses it
+temporarily without installing pip globally. Dependency downloads finish in
+temporary storage before permanent API directories are created, so download
+failures can be retried. Named setup stages identify where a failure occurred.
 
 Enter server domain, public IPv4, the website's **outgoing** IPv4, and TCP port
 (default 9443). IPv4 serving only in this release. Check the provider firewall
