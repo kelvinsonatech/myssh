@@ -65,7 +65,7 @@ class Native:
 
     def active(self, service):
         return self.run(["systemctl", "is-active", "--quiet", service + ".service"],
-                        check=False).returncode == 0
+                        check=False, timeout=1).returncode == 0
 
     def ssh_service(self):
         return "ssh" if self.active("ssh") else "sshd"
@@ -137,7 +137,11 @@ class Native:
                            "ports": ports, "transports": sorted({c["network"] for c in config.get("connections", [])}),
                            "current_accounts": self.count(protocol), "max_accounts": None,
                            "metadata": {"account_scope": "shared_linux_user" if protocol in SSH else "native",
-                                        "changes_restart_service": protocol in (*XRAY, "hysteria", "zivpn")}})
+                                        "changes_restart_service": False,
+                                        "api_provisioning": protocol in (*SSH, "hysteria2"),
+                                        "provisioning_blocker": (
+                                            "Live updates have not been verified for this installation"
+                                            if protocol in (*XRAY, "hysteria", "zivpn") else None)}})
         return result
 
     def connection(self, protocol, user, secret):
@@ -199,6 +203,9 @@ class Native:
 
     def prepare(self, body):
         protocol, user = body["protocol"], body["username"]
+        if protocol in (*XRAY, "hysteria", "zivpn"):
+            raise Fault("PROTOCOL_UNAVAILABLE",
+                        "No verified no-restart adapter for this installation", 409)
         if not self.installed(protocol) or not self.running(protocol):
             raise Fault("PROTOCOL_UNAVAILABLE", "Activate this protocol in the server menu first", 409)
         if protocol in SSH:
