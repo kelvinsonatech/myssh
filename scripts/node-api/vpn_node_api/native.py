@@ -366,9 +366,12 @@ class Native:
                         raise Uncertain("New SSH account needs administrator recovery")
                 raise
         elif operation == "delete":
-            # Match the existing menu: terminate only this user's sessions.
-            self.run(["pkill", "-KILL", "-u", user], check=False)
-            self.run(["userdel", user])
+            # Logical revocation: deny new logins without killing even this
+            # user's established sessions. Retain the UID to prevent reuse.
+            try:
+                self.run(["chage", "-E", "1970-01-02", user])
+            except Fault:
+                raise Uncertain("Verify whether native revocation completed")
         else:
             self.run(["chage", "-E", account["expires_at"][:10], user])
 
@@ -386,7 +389,7 @@ class Native:
         services = {}
         for service in (self.ssh_service(), "dropbear", "stunnel4", "ws-proxy", "xray",
                         "hysteria-udp", "hysteria2", "zivpn", "slowdns"):
-            result = self.run(["systemctl", "is-active", service + ".service"], check=False)
+            result = self.run(["systemctl", "is-active", service + ".service"], check=False, timeout=1)
             services[service] = "running" if result.returncode == 0 else (
                 "unknown" if result.stdout.strip() == "unknown" else "stopped")
         return {"status": "online", "uptime_seconds": int(float(self.text("/proc/uptime").split()[0])),

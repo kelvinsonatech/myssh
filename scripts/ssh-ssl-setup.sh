@@ -4460,6 +4460,49 @@ zi_menu() (
     done
 )
 
+node_api_menu() {
+    local choice work
+    while :; do
+        section "WEBSITE API / HTTPS" "$TEAL"
+        note "No VPN restarts. SSH / SSL / SlowDNS / HY2 when active."
+        note "Xray / HY1 / ZIVPN API writes are not yet supported."
+        echo "  1  Install optional API"
+        echo "  2  Status / connection details"
+        echo "  3  Rotate API credentials"
+        echo "  4  Disable API only"
+        echo "  0  Back"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1)
+                if [ -f /etc/vpn-node-api/config.json ]; then
+                    note "Already configured; use status."
+                else
+                    work=$(mktemp /tmp/node-api-setup.XXXXXXXX) || return
+                    if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+                        "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
+                        -o "$work" &&
+                       printf '%s  %s\n' "24fc2df129d2fcf4ab5039ba435f28c4bf2cf5c6fc64095d3e14123a7883c5f9" "$work" | sha256sum -c - >/dev/null; then
+                        bash "$work" || err "API setup stopped; VPN services were not restarted."
+                    else err "Download/verification failed; nothing executed."; fi
+                    rm -f "$work"
+                fi
+                pause;;
+            2|3|4)
+                if [ ! -x /usr/local/bin/vpn-node-api ]; then err "Install the API first."
+                else
+                    case "$choice" in
+                        2) /usr/local/bin/vpn-node-api status;;
+                        3) /usr/local/bin/vpn-node-api rotate;;
+                        4) /usr/local/bin/vpn-node-api disable;;
+                    esac
+                fi
+                pause;;
+            0|"") return;;
+            *) err "Invalid option.";;
+        esac
+    done
+}
+
 menu_item() {  # menu_item NUM ICON "Label" color
     echo -e "  ${4}${BOLD}$1${NC} ${GR}│${NC} ${4}$2${NC}  ${W}$3${NC}"
 }
@@ -4484,6 +4527,7 @@ while true; do
     menu_item "14" "🚀" "Activate fast DNS"        "$TEAL"
     menu_item "15" "⚡" "Hysteria 2 (UDP)"          "$LIME"
     menu_item "16" "◇" "ZIVPN (isolated UDP)"      "$TEAL"
+    menu_item "17" "◇" "Website API (HTTPS)"        "$SKY"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -4504,6 +4548,7 @@ while true; do
         14) fastdns_menu ;;
         15) hy2_menu ;;
         16) zi_menu ;;
+        17) node_api_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
