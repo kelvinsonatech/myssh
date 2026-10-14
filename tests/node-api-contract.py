@@ -180,6 +180,29 @@ class Contract(unittest.TestCase):
                     require_safe_port(9443)
                 sock.assert_not_called()
 
+    def test_ssh_creation_uses_valid_gecos_and_stdin_password(self):
+        native = Native(self.config)
+        account = {"protocol": "ssh", "username": "apitest_fixture",
+                   "account_id": "acc_fixture", "expires_at": "2099-01-02T00:00:00Z",
+                   "config": {"password": "test-password"}}
+        calls = []
+        def command(argv, data=None, **kwargs):
+            calls.append((argv, data))
+            if argv[0] == "useradd":
+                comment = argv[argv.index("-c") + 1]
+                self.assertNotIn(":", comment)
+                self.assertNotIn("\n", comment)
+                self.assertEqual(comment, "vpn-node=acc_fixture")
+            return SimpleNamespace(returncode=0, stdout="")
+        with patch.object(native, "run", side_effect=command):
+            native.ssh_operation("create", account)
+        self.assertEqual(calls[1], (["chpasswd"], "apitest_fixture:test-password\n"))
+        self.assertTrue(all("test-password" not in str(argv) for argv, _ in calls))
+        entry = SimpleNamespace(pw_uid=1001, pw_gecos="vpn-node=acc_fixture")
+        with patch("vpn_node_api.native.pwd.getpwnam", return_value=entry):
+            self.assertTrue(native.owns(account))
+            self.assertFalse(native.owns({**account, "account_id": "acc_other"}))
+
 
 if __name__ == "__main__":
     unittest.main()

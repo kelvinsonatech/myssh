@@ -4481,7 +4481,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "24fc2df129d2fcf4ab5039ba435f28c4bf2cf5c6fc64095d3e14123a7883c5f9" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "6499617c5496adf7618ffdc100d51eaf69262c8445557cc6b5c4281e96bed059" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"

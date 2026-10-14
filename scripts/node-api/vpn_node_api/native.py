@@ -257,7 +257,7 @@ class Native:
                 entry = pwd.getpwnam(user)
             except KeyError:
                 return False
-            return entry.pw_uid >= 1000 and entry.pw_gecos == "vpn-node:" + account["account_id"]
+            return entry.pw_uid >= 1000 and entry.pw_gecos == "vpn-node=" + account["account_id"]
         if protocol in XRAY:
             return any(r[:3] == [protocol, user, secret] for r in self.xrows())
         if protocol == "zivpn":
@@ -356,7 +356,7 @@ class Native:
         if operation == "create":
             try:
                 self.run(["useradd", "-e", account["expires_at"][:10], "-M", "-s", "/bin/false",
-                          "-c", "vpn-node:" + account["account_id"], user])
+                          "-c", "vpn-node=" + account["account_id"], user])
                 self.run(["chpasswd"], user + ":" + secret + "\n")
             except Exception:
                 if self.owns(account):
