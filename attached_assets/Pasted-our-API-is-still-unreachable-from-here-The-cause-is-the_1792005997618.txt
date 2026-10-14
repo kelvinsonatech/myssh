@@ -1,0 +1,32 @@
+our API is still unreachable from here. The cause is the firewall rule on port 9444, not your API.
+
+Your installer set the allowed website IP to 192.53.121.138, which is the VPS’s own address. So the API only accepts connections from the server itself. My earlier checks confirmed this: the server answers normally on port 443, but connections to port 9444 are dropped.
+
+This session connects from addresses in 160.79.106.0/24. In 8 checks I saw .19, .20, .21, .132, .142 and .143, so it needs the whole range.
+
+On the VPS, allow that range on port 9444 temporarily:
+
+If your installer used iptables instead of ufw:
+
+If your API also has its own allowed-IP setting, add the same range there. Then tell me, and I’ll run the full test.
+
+What the test checks:
+
+Login security: unsigned, wrong-secret, expired and replayed requests must all be refused.
+/info, /health and /protocols against the website’s expected format.
+For each protocol, a 1-day test account. The test confirms that:
+it is created;
+retrying the same request returns the same account instead of a second one;
+the website can read its settings;
+it is deleted again afterwards.
+I built that test tool while waiting. It’s npm run node:check in the project, and I’ve already tested it against the simulated server.
+
+After testing:
+
+Remove the temporary rule, for example ufw delete allow from 160.79.106.0/24 to any port 9444 proto tcp.
+Rotate the API secret. It’s now visible in this chat. Next time I’ll ask you to add it as an environment variable in the session settings instead of pasting it here.
+When the website is hosted on its own server, set that server’s IP as the allowed website IP.
+Hook re-prompted Claude, ran 2 commands
+I committed and pushed the API test tool (npm run node:check, commit ecb0432). I checked first that your secret isn’t in any committed file. The secret is stored only in this session’s private temporary folder, readable by its owner only.
+
+I still can’t test your API: port 9444 only accepts connections from the server itself. Once you’ve run the firewall command from my last message, tell me and I’ll run the full account-creation test.
