@@ -7,6 +7,11 @@ The user requires website-driven account creation without disconnecting any
 existing user, across all supported protocols. Do not fall back to restarting a
 shared tunnel process when live account changes are unavailable.
 
+The user explicitly chose **no VPN restarts at all**, including one-time setup
+and scheduled maintenance, after being told that the revised contract permits
+setup restarts and a daily ZIVPN password-pool refresh. Do not implement either
+exception without new explicit authorization.
+
 **Why:** the user explicitly rejected the restart-based approach after supplying
 the website API contract. A technically compatible JSON API is insufficient if
 provisioning disconnects customers.

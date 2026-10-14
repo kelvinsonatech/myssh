@@ -140,11 +140,16 @@ class Store:
             """)
         os.chmod(self.path, 0o600)
 
+    @contextlib.contextmanager
     def connect(self):
         db = sqlite3.connect(self.path, timeout=2)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA synchronous=FULL")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def nonce(self, nonce, now):
         with self.connect() as db:
