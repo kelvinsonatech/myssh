@@ -1,0 +1,16 @@
+pin = "dba3be58142d2643b17a5b899e62d8c82f8258e346acb3f70bc2fb99a84e0a37"
+for endpoint in ("info", "health", "protocols"): path = "/api/v1/" + endpoint timestamp = str(int(time.time())) nonce = uuid.uuid4().hex message = "\n".join([ "VL1-HMAC-SHA256", "GET", path, timestamp, nonce, hashlib.sha256(b"").hexdigest() ]) signature = hmac.new( cfg["secret"].encode(), message.encode(), hashlib.sha256 ).hexdigest()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+conn = http.client.HTTPSConnection(
+    cfg["public_ip"], cfg["port"], context=ctx, timeout=10,
+    source_address=(cfg["public_ip"], 0)
+)
+try:
+    conn.connect()
+    actual = hashlib.sha256(
+        conn.sock.getpeercert(binary_form=True)
+    ).hexdigest()
+    if not hmac.compare_digest(actual, pin):
+PY      conn.close()nt, type(error).name, str(error))uest not sent") info HTTP 200 {"ok":true,"data":{"api_version":"1.0","agent_version":"1.0.0","status":"online","hostname":"tests.clemsrek.com","public_ip":"192.53.121.138","country":"","server_time":"2026-10-14T19:00:52Z","protocols":["ssh","ssh-ssl","slowdns"],"capabilities":{"idempotency":true,"lookup_by_request_id":true,"renew":true,"list_accounts":true,"restart_agent":false,"expiry_managed_by_node":false}}} health HTTP 200 {"ok":true,"data":{"status":"online","uptime_seconds":2309,"cpu_percent":0.0,"memory":{"total_bytes":8326422528,"used_bytes":518787072},"disk":{"used_bytes":2761969664,"total_bytes":168471793664},"load":[0.0,0.0,0.0],"services":{"ssh":"running","dropbear":"running","stunnel4":"running","ws-proxy":"running","xray":"stopped","hysteria-udp":"stopped","hysteria2":"stopped","zivpn":"stopped","slowdns":"running"}}} protocols HTTP 200 {"ok":true,"data":{"protocols":[{"id":"ssh","installed":true,"running":true,"ports":{"openssh":[22],"dropbear":[109,143],"ws":[80],"ws_tls":[443]},"transports":[],"current_accounts":6,"max_accounts":null,"metadata":{"account_scope":"shared_linux_user","changes_restart_service":false,"api_provisioning":true,"provisioning_blocker":null}},{"id":"ssh-ssl","installed":true,"running":true,"ports":{"ssl":[443,447],"ws_tls":[443]},"transports":[],"current_accounts":6,"max_accounts":null,"metadata":{"account_scope":"shared_linux_user","changes_restart_service":false,"api_provisioning":true,"provisioning_blocker":null}},{"id":"slowdns","installed":true,"running":true,"ports":{"slowdns":[53],"openssh":[22]},"transports":[],"current_accounts":6,"max_accounts":null,"metadata":{"account_scope":"shared_linux_user","changes_restart_service":false,"api_provisioning":true,"provisioning_blocker":null}}]}}
