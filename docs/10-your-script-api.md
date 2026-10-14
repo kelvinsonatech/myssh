@@ -64,6 +64,46 @@ manager later removes that rule. No forwarding headers are trusted.
 
 ## Credentials and administration
 
+### IP whitelist for website testing
+
+Menu **17 → 5 — Allowed IPs / whitelist** supports IPv4 addresses and CIDR ranges.
+The same controls are available directly:
+
+```sh
+sudo vpn-node-api whitelist list
+sudo vpn-node-api whitelist add 160.79.106.0/24
+sudo vpn-node-api whitelist remove 160.79.106.0/24
+```
+
+Use the range only after verifying it with the website tester. A /24 permits
+256 source addresses, potentially shared with other customers. Signed HMAC
+authentication remains mandatory. The whole Internet (`0.0.0.0/0`), IPv6,
+hostnames and removing the last entry are rejected. Removing a specific IP
+does not block it if another remaining range still covers it.
+
+Changes apply to the configured **API TCP port only**, not VPN ports or NAT.
+The API reads the saved whitelist for each request; adding/removing entries
+requires **no service restart**. Owned firewall-chain replacement is atomic,
+with rollback and a recovery journal. Unknown rules or references to the API
+chain are not overwritten. The saved list is reapplied when the API starts.
+
+Temporary testing access is **not automatically timed out**: remove the range
+after testing. Rotate any secret that was exposed in chat and put the replacement
+only in the website backend's secure environment settings.
+
+Existing installations can install this feature without rerunning VPN setup:
+
+```sh
+sudo bash scripts/node-api/install.sh --update-api
+```
+
+Run that command from an updated repository checkout, or pass `--update-api`
+to a verified fresh download of the API-only installer. It backs up API code
+and the menu, preserves credentials, dependencies and account state, and stops/
+starts **only the web API** if it was running. VPN services are untouched.
+Reopen the menu afterward. Setup readiness now checks the listening API process,
+rather than making a loopback connection that the whitelist could block.
+
 Setup prints the base URL, public IP, port, key ID, fingerprint and secret.
 The secret is printed only once and stored in mode-600
 `/etc/vpn-node-api/config.json`. Do not post it in chat or source control.

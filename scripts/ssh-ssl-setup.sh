@@ -4470,6 +4470,7 @@ node_api_menu() {
         echo "  2  Status / connection details"
         echo "  3  Rotate API credentials"
         echo "  4  Disable API only"
+        echo "  5  Allowed IPs / whitelist"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4481,19 +4482,20 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "6499617c5496adf7618ffdc100d51eaf69262c8445557cc6b5c4281e96bed059" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "f87526733d2c43130dc5d229192322bc75d89203c2979930b7bf11c785d86dbf" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"
                 fi
                 pause;;
-            2|3|4)
+            2|3|4|5)
                 if [ ! -x /usr/local/bin/vpn-node-api ]; then err "Install the API first."
                 else
                     case "$choice" in
                         2) /usr/local/bin/vpn-node-api status;;
                         3) /usr/local/bin/vpn-node-api rotate;;
                         4) /usr/local/bin/vpn-node-api disable;;
+                        5) /usr/local/bin/vpn-node-api whitelist;;
                     esac
                 fi
                 pause;;
