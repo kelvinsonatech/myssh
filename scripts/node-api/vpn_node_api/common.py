@@ -134,7 +134,7 @@ class Store:
               CREATE TABLE IF NOT EXISTS requests (
                 id TEXT PRIMARY KEY, hash TEXT NOT NULL, state TEXT NOT NULL,
                 operation TEXT NOT NULL, document TEXT NOT NULL, result TEXT,
-                created INTEGER NOT NULL DEFAULT (unixepoch()));
+                created INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)));
               CREATE TABLE IF NOT EXISTS nonces (
                 nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
             """)
