@@ -7,3 +7,4 @@
 - [SlowDNS isolation](slowdns-udp53.md) — submenu-only, private Go; protect working protocols, preserve DNS, never kill unknown UDP 53 owners.
 - [Hysteria 2 coexistence](hysteria2-isolation.md) — isolate from HY1; UDP 53 handover requires confirmation and restoration, including installer/restart paths.
 - [ZIVPN isolation](zivpn-isolation.md) — actual upstream binary; user confirmed working; preserve protocol isolation and concise details.
+- [Node API nondisruption](node-api-nondisruption.md) — no shared-tunnel restarts for website account creation; live updates and initial migration must be verified separately.

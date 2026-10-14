@@ -37,6 +37,22 @@ were unsafe for a multi-protocol VPS. They are superseded; do not reintroduce th
 **How to apply:** check actual listening state after startup, fail closed on
 unknown listeners and redirect rules, and retain rollback backups after failure.
 
+## Non-root resolver configuration under a private umask
+
+Keep private keys protected, but explicitly make non-secret configuration
+readable/traversable by the daemon account that consumes it. Restore original
+directory permissions as well as files when a resolver handover rolls back.
+
+**Why:** the user confirmed a root-owned mode-700 resolver configuration directory
+on a server where resolved runs as systemd-resolve. The earlier SlowDNS installer
+inherited umask 077; this predates ZIVPN. A successful resolver restart alone does
+not prove it could read the instruction to release port 53.
+
+**How to apply:** test SlowDNS deployment under umask 077 with both new and
+pre-existing restricted resolver directories. Model non-root readability in
+tests; a root-only test can conceal this failure. Retain the UDP-listener and
+DNS-resolution checks, and never relax private-key permissions.
+
 ## Upstream source transport
 
 Use a full clone of bamsoftware's dnstt repository, not a shallow clone.

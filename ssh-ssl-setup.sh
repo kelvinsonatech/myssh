@@ -2924,6 +2924,7 @@ slowdns_deploy() (
     # before mutation; failure/signal restores files, resolver and enable state.
     local committed=0 touched=0 resolved_changed=0 enabled=0 path i=0
     local dropin=/etc/systemd/resolved.conf.d/zz-ssh-panel-slowdns.conf
+    local dropin_dir="${dropin%/*}" dropin_dir_mode="" dropin_dir_created=0
     local -a files=(/usr/local/bin/dnstt-server /etc/systemd/system/slowdns.service
         "$CONF_DIR/nsdomain.conf" /etc/slowdns/server.key /etc/slowdns/server.pub
         "$dropin" /etc/resolv.conf)
@@ -2937,6 +2938,13 @@ slowdns_deploy() (
                 cp -a "$SD_WORK/backup/$i" "$path" || echo "RESTORE FAILED: $path"
             i=$((i+1))
         done
+        if [ "$resolved_changed" = 1 ]; then
+            if [ -n "$dropin_dir_mode" ]; then
+                chmod "$dropin_dir_mode" "$dropin_dir" || echo "RESTORE FAILED: $dropin_dir permissions"
+            elif [ "$dropin_dir_created" = 1 ]; then
+                rmdir "$dropin_dir" || echo "Retained nonempty resolver config directory: $dropin_dir"
+            fi
+        fi
         systemctl daemon-reload || true
         if [ "$enabled" = 1 ]; then systemctl enable slowdns.service || true
         else systemctl disable slowdns.service || true; fi
@@ -2950,16 +2958,27 @@ slowdns_deploy() (
         { echo "SlowDNS became active; refusing to interrupt it."; exit 1; }
     slowdns_port_check || exit 1
     systemctl is-enabled --quiet slowdns.service && enabled=1
+    if [ -d "$dropin_dir" ]; then
+        dropin_dir_mode=$(stat -c '%a' "$dropin_dir") || exit 1
+    fi
     mkdir -p "$SD_WORK/backup" || exit 1
     for path in "${files[@]}"; do
         if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$SD_WORK/backup/$i" || exit 1; fi
         i=$((i+1))
     done
     touched=1
-    mkdir -p /etc/slowdns "$CONF_DIR" /etc/systemd/resolved.conf.d || exit 1
+    mkdir -p /etc/slowdns "$CONF_DIR" || exit 1
     if [ "$SD_RESOLVED" = 1 ]; then
         resolved_changed=1
+        # systemd-resolved runs as its own user. The installer's private umask
+        # must not make this non-secret configuration inaccessible to it.
+        if [ ! -d "$dropin_dir" ]; then
+            mkdir -m 755 "$dropin_dir" || exit 1
+            dropin_dir_created=1
+        fi
+        chmod 755 "$dropin_dir" || exit 1
         printf '[Resolve]\nDNSStubListener=no\n' > "$dropin" || exit 1
+        chmod 644 "$dropin" || exit 1
         # Preserve regular resolver files; only switch a symlink/regular file
         # containing a loopback nameserver that would otherwise stop resolving.
         if grep -qE '^nameserver[[:space:]]+(127\.|::1([[:space:]]|$))' /etc/resolv.conf; then
