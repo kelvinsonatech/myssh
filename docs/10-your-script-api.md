@@ -166,8 +166,23 @@ Example create body:
 }
 ```
 
-Native date-based expiry is returned as its real UTC boundary, not an invented
-per-second deadline. SSH variants share Linux usernames. Deleting an API SSH
+API-created accounts use one creation-time UTC clock reading: `expires_at` is
+`created_at + duration_days * 24 hours`, returned as a full ISO 8601 UTC timestamp
+at second precision, without rounding to midnight. Renewal adds full 24-hour days
+to the later of the current expiry and now. Stored timestamps and idempotent
+replays preserve that deadline.
+
+For API SSH, SSH-SSL and SlowDNS accounts, Linux `useradd -e` / `chage -E` uses the
+UTC calendar date AFTER `expires_at` as a safety net. For example, creation at
+`2026-10-16T20:00:00Z` for one day returns `2026-10-17T20:00:00Z`, while Linux
+shows October 18. Hysteria 2's native valid-through date is the exact deadline's
+UTC date, so it does not reject new connections prematurely. Its API record still
+stores the full timestamp. Unsupported Xray/Hysteria 1/ZIVPN adapters remain
+blocked rather than enabling service restarts to implement expiry.
+
+These rules do not migrate existing accounts or change manual-menu expiry rules.
+Only subsequent API creation/renewal uses the new calculation. No service restart
+is performed by those operations. SSH variants share Linux usernames. Deleting an API SSH
 account expires its Linux login but retains its UID and existing sessions;
 that username cannot be reused automatically. Hysteria 2 revocation/expiry
 denies new connections; existing sessions finish naturally. Expiry handling

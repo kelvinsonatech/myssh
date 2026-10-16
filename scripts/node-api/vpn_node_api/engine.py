@@ -118,8 +118,6 @@ class Engine:
                     if operation == "renew":
                         end = dt.datetime.fromisoformat(account["expires_at"].replace("Z", "+00:00"))
                         end = max(end, utcnow()) + dt.timedelta(days=body["duration_days"])
-                        if account["protocol"] in (*SSH, *XRAY, "hysteria2"):
-                            end = end.replace(hour=0, minute=0, second=0, microsecond=0)
                         account["expires_at"], account["status"] = stamp(end), "active"
                 db.execute("INSERT INTO requests(id,hash,state,operation,document) VALUES (?,?,'pending',?,?)",
                            (key, payload_hash, operation, json.dumps(account)))

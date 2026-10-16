@@ -8,6 +8,7 @@ import unittest
 import uuid
 import hashlib
 import hmac
+import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -107,6 +108,74 @@ class Contract(unittest.TestCase):
             response = self.request("GET", path)
             self.assertEqual(response.status_code, 404)
             self.assertNotIn("location", response.headers)
+
+    def test_exact_expiry_and_renewal_survive_replay_and_storage(self):
+        created = dt.datetime(2096, 2, 28, 20, 17, 39, 123456, tzinfo=dt.timezone.utc)
+        body = {**self.body(), "duration_days": 1}
+        with patch("vpn_node_api.native.utcnow", return_value=created):
+            response = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+        self.assertEqual(response.status_code, 201, response.text)
+        account = response.json()["data"]["account"]
+        self.assertEqual(account["created_at"], "2096-02-28T20:17:39Z")
+        self.assertEqual(account["expires_at"], "2096-02-29T20:17:39Z")
+        self.assertEqual(dt.datetime.fromisoformat(account["expires_at"]) -
+                         dt.datetime.fromisoformat(account["created_at"]), dt.timedelta(hours=24))
+        self.assertIn("traveller\t", self.account_file.read_text())
+        self.assertIn("\t20960229\n", self.account_file.read_text())
+        self.assertIn(self.original, self.account_file.read_text())
+        identity = account["account_id"]
+        replay = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+        self.assertEqual(replay.json()["data"]["account"], account)
+        self.assertEqual(self.store.account(identity)["expires_at"], account["expires_at"])
+        for now, expected in ((created, "2096-03-01T20:17:39Z"),
+                              (dt.datetime(2096, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc),
+                               "2097-01-01T23:59:59Z")):
+            renew = {"request_id": str(uuid.uuid4()), "duration_days": 1}
+            with patch("vpn_node_api.engine.utcnow", return_value=now):
+                response = self.request("POST", f"/api/v1/accounts/{identity}/renew",
+                                        renew, renew["request_id"])
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["data"]["account"]["expires_at"], expected)
+        info = self.request("GET", "/api/v1/info").json()["data"]
+        self.assertIs(info["capabilities"]["expiry_managed_by_node"], False)
+
+    def test_ssh_family_exact_creation_and_next_date_safety_net(self):
+        created = dt.datetime(2099, 12, 30, 20, 0, tzinfo=dt.timezone.utc)
+        for protocol in ("ssh", "ssh-ssl", "slowdns"):
+            with self.subTest(protocol=protocol):
+                body = {**self.body(), "protocol": protocol, "duration_days": 1,
+                        "username": "api_" + protocol.replace("-", "_")}
+                calls = []
+                def command(argv, data=None, **kwargs):
+                    self.assertIn(argv[0], ("useradd", "chpasswd", "chage"))
+                    calls.append(argv)
+                    return SimpleNamespace(returncode=0, stdout="")
+                with patch.object(self.native, "installed", return_value=True), \
+                     patch.object(self.native, "running", return_value=True), \
+                     patch.object(self.native, "connection", return_value={"password": "test-password"}), \
+                     patch("vpn_node_api.native.pwd.getpwnam", side_effect=KeyError), \
+                     patch("vpn_node_api.native.utcnow", return_value=created), \
+                     patch.object(self.native, "run", side_effect=command):
+                    response = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+                    self.assertEqual(response.status_code, 201, response.text)
+                    account = response.json()["data"]["account"]
+                    self.assertEqual(account["created_at"], "2099-12-30T20:00:00Z")
+                    self.assertEqual(account["expires_at"], "2099-12-31T20:00:00Z")
+                    self.assertEqual(calls[0][0:3], ["useradd", "-e", "2100-01-01"])
+                    self.native.ssh_operation("renew", account)
+                    self.assertEqual(calls[-1], ["chage", "-E", "2100-01-01", body["username"]])
+                self.assertEqual(self.account_file.read_text(), self.original)
+
+    def test_linux_safety_date_midnight_and_leap_year(self):
+        native = Native(self.config)
+        for exact, safety in (("2096-02-28T00:00:00Z", "2096-02-29"),
+                              ("2096-02-29T23:59:59Z", "2096-03-01"),
+                              ("2100-02-28T20:00:00Z", "2100-03-01")):
+            account = {"username": "api_fixture", "expires_at": exact,
+                       "config": {"password": "test-password"}}
+            with patch.object(native, "run") as command:
+                native.ssh_operation("renew", account)
+                command.assert_called_once_with(["chage", "-E", safety, "api_fixture"])
 
     def test_invalid_username_and_password_do_not_mutate(self):
         for changes in ({"username": "root"}, {"username": "a; reboot"},

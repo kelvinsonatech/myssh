@@ -12,6 +12,17 @@ and scheduled maintenance, after being told that the revised contract permits
 setup restarts and a daily ZIVPN password-pool refresh. Do not implement either
 exception without new explicit authorization.
 
+API expiry must represent full 24-hour days from creation in UTC, not midnight
+rounding. Only API-created accounts are in scope; leave manual-menu expiry alone.
+Linux expiry is the UTC calendar date after the exact API deadline as a safety
+net, and the website remains responsible for DELETE at the precise deadline.
+
+**Why:** the user explicitly requested full-duration API accounts without early
+native expiration or changes to other protocol/user behavior.
+
+**How to apply:** preserve exact deadlines on creation, renewal and replay;
+keep node-managed expiry disabled and never add a service restart to enforce it.
+
 Optional API prerequisite repair must not use distro package installation
 automatically: package hooks can restart unrelated services. Use isolated
 temporary, checksum-verified Python tooling when system pip is missing.

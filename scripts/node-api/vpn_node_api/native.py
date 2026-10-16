@@ -237,13 +237,11 @@ class Native:
                 raise Fault("VALIDATION_FAILED", "Hysteria 2 currently requires 8+ letters/digits/_.@!+-")
             if any(row[1] == secret for row in self.password_rows(protocol)):
                 raise Fault("USERNAME_TAKEN", "That tunnel password is already assigned", 409)
-        end = utcnow() + dt.timedelta(days=body["duration_days"])
-        # Native SSH/Xray expiry is date-based. Return the actual boundary.
-        if protocol in (*SSH, *XRAY, "hysteria2"):
-            end = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        created = utcnow()
+        end = created + dt.timedelta(days=body["duration_days"])
         return {"account_id": "acc_" + uuid.uuid4().hex, "request_id": body["request_id"],
                 "protocol": protocol, "username": user, "status": "active",
-                "created_at": stamp(), "expires_at": stamp(end),
+                "created_at": stamp(created), "expires_at": stamp(end),
                 "config": self.connection(protocol, user, secret)}
 
     def secret(self, account):
@@ -297,7 +295,9 @@ class Native:
                 rows = [r for r in rows if r[0] != user]
                 if operation != "delete":
                     expiry = dt.datetime.fromisoformat(account["expires_at"].replace("Z", "+00:00"))
-                    rows.append([user, secret, (expiry - dt.timedelta(days=1)).strftime("%Y%m%d")])
+                    # Native auth is valid THROUGH this UTC date. The website
+                    # revokes at the precise API timestamp; do not expire early.
+                    rows.append([user, secret, expiry.astimezone(dt.timezone.utc).strftime("%Y%m%d")])
                 self.write(FILES[protocol][0], "".join("\t".join(r) + "\n" for r in rows))
             elif operation != "renew":
                 if protocol == "hysteria":
@@ -353,9 +353,15 @@ class Native:
 
     def ssh_operation(self, operation, account):
         user, secret = account["username"], self.secret(account)
+        if operation != "delete":
+            expiry = dt.datetime.fromisoformat(account["expires_at"].replace("Z", "+00:00"))
+            # Linux shadow stores dates, not times. Use the following UTC date
+            # only as a safety net; the website owns exact-time revocation.
+            safety_date = (expiry.astimezone(dt.timezone.utc).date() +
+                           dt.timedelta(days=1)).isoformat()
         if operation == "create":
             try:
-                self.run(["useradd", "-e", account["expires_at"][:10], "-M", "-s", "/bin/false",
+                self.run(["useradd", "-e", safety_date, "-M", "-s", "/bin/false",
                           "-c", "vpn-node=" + account["account_id"], user])
                 self.run(["chpasswd"], user + ":" + secret + "\n")
             except Exception:
@@ -373,7 +379,7 @@ class Native:
             except Fault:
                 raise Uncertain("Verify whether native revocation completed")
         else:
-            self.run(["chage", "-E", account["expires_at"][:10], user])
+            self.run(["chage", "-E", safety_date, user])
 
     def health(self):
         memory = {}
