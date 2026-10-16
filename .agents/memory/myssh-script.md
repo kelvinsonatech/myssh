@@ -10,3 +10,6 @@ description: Durable rules for editing/pushing the standalone SSH/VPN setup scri
 - The api-server/mockup-sandbox workflows in this workspace are unrelated to this script — ignore their logs.
 - **`set -e` gotcha:** the installer runs under `set -e`, so a bare `[ cond ] && cmd` as a statement's last line aborts the whole script when the test is false (returns 1). Use `if [ cond ]; then cmd; fi` instead. Bit us in the phase() progress function.
 - User wants minimal, tight-scoped changes; open question: suspend (keep UUID) vs delete over-limit Xray accounts.
+- Updates must not rerun the full VPN installer. Treat management-menu updates and web-API updates as separate choices; never silently migrate installed protocol helpers.
+- **Why:** the user wants in-menu updates specifically to avoid unnecessary setup runs and disruption to working protocols.
+- **How to apply:** default to code-only menu replacement; obtain explicit confirmation for the API-only restart, and separately scope any future protocol migration.

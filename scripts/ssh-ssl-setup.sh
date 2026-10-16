@@ -4471,6 +4471,7 @@ node_api_menu() {
         echo "  3  Rotate API credentials"
         echo "  4  Disable API only"
         echo "  5  Allowed IPs / whitelist"
+        echo "  6  Update script / API"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4499,10 +4500,42 @@ node_api_menu() {
                     esac
                 fi
                 pause;;
+            6) script_update_menu;;
             0|"") return;;
             *) err "Invalid option.";;
         esac
     done
+}
+
+script_update_menu() {
+    section "SCRIPT UPDATES" "$TEAL"
+    note "Fetching the updater securely. Server setup will NOT run."
+    command -v python3 >/dev/null || { err "Python 3 is required."; pause; return; }
+    python3 - <<'SCRIPTUPDATEPY'
+import base64, hashlib, json, urllib.request
+try:
+    url = "https://api.github.com/repos/kelvinsonatech/myssh/contents/scripts/update-script.py?ref=replit-agent"
+    request = urllib.request.Request(url, headers={"User-Agent": "ssh-panel-updater"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read(262145)
+    if len(raw) > 262144:
+        raise ValueError("Updater response too large")
+    item = json.loads(raw)
+    if item.get("type") != "file" or item.get("encoding") != "base64":
+        raise ValueError("Unexpected updater response")
+    source = base64.b64decode(item["content"].replace("\n", ""), validate=True)
+    actual = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
+    if actual != item["sha"] or len(source) != item["size"]:
+        raise ValueError("Updater integrity check failed")
+    # Python source arrived via stdin; reconnect interactive prompts to terminal.
+    import sys
+    sys.stdin = open("/dev/tty")
+    exec(compile(source, "verified-script-updater", "exec"), {"__name__": "__main__"})
+except (ValueError, OSError, KeyError) as exc:
+    print("Cannot load updater:", exc)
+    raise SystemExit(1)
+SCRIPTUPDATEPY
+    pause
 }
 
 menu_item() {  # menu_item NUM ICON "Label" color
@@ -4530,6 +4563,7 @@ while true; do
     menu_item "15" "⚡" "Hysteria 2 (UDP)"          "$LIME"
     menu_item "16" "◇" "ZIVPN (isolated UDP)"      "$TEAL"
     menu_item "17" "◇" "Website API (HTTPS)"        "$SKY"
+    menu_item "18" "↻" "Update script"               "$TEAL"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -4551,6 +4585,7 @@ while true; do
         15) hy2_menu ;;
         16) zi_menu ;;
         17) node_api_menu ;;
+        18) script_update_menu ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
