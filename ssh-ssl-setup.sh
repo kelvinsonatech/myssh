@@ -4471,7 +4471,7 @@ node_api_menu() {
         echo "  3  Rotate API credentials"
         echo "  4  Disable API only"
         echo "  5  Allowed IPs / whitelist"
-        echo "  6  Update script / API"
+        echo "  6  Update script"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in

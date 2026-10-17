@@ -139,49 +139,6 @@ def _install_menu(menu, revision):
     print("Close and reopen menu to load the updated version.")
 
 
-def rollback():
-    previous = STATE / "previous-menu"
-    if not previous.is_file():
-        raise ValueError("No previous menu backup is available")
-    install_menu(previous.read_bytes(), "local-backup")
-
-
-def update_api(revision):
-    if not API_CONFIG.is_file():
-        raise ValueError("API is not installed; use its installation submenu first")
-    with tempfile.TemporaryDirectory(prefix="ssh-panel-api-update-") as folder:
-        root = Path(folder)
-        installer = download("scripts/node-api/install.sh", revision).decode()
-        manifest = installer.split("done <<'API_MANIFEST'\n", 1)[1].split("\nAPI_MANIFEST", 1)[0]
-        package = root / "vpn_node_api"
-        package.mkdir(mode=0o700)
-        names = set()
-        for row in manifest.splitlines():
-            digest, name = row.split()
-            if not re.fullmatch(r"[a-z_]+\.py", name) or name in names:
-                raise ValueError("Unsafe API release manifest")
-            names.add(name)
-            data = download("scripts/node-api/vpn_node_api/" + name, revision)
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise ValueError("API checksum mismatch: " + name)
-            compile(data, name, "exec")
-            (package / name).write_bytes(data)
-        if not {"__init__.py", "control.py", "access.py", "native.py", "engine.py",
-                "__main__.py", "common.py", "links.py", "server.py"}.issubset(names):
-            raise ValueError("Incomplete API release")
-        installed = API_HOME / "vpn_node_api"
-        if all((installed / name).is_file() and
-               (installed / name).read_bytes() == (package / name).read_bytes()
-               for name in names):
-            print("Web API code is already up to date. No services restarted.")
-            return
-        env = dict(os.environ, PYTHONPATH=str(root))
-        # Existing updater preserves configuration/credentials/data and manages
-        # only vpn-node-api.service. No installer, pip or apt invocation.
-        subprocess.run([sys.executable, "-m", "vpn_node_api.control", "update"],
-                       env=env, check=True, timeout=180)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--menu-only", action="store_true",
@@ -190,39 +147,16 @@ def main():
     if os.geteuid() != 0:
         raise ValueError("Run as root")
     with update_lock():
-        if args.menu_only:
-            revision = latest()
-            install_menu(release_menu(revision), revision)
-            return
-        while True:
-            print("\nSCRIPT UPDATES\n"
-                  "  1  Check / update management menu (no restarts)\n"
-                  "  2  Update web API only (API restart confirmation required)\n"
-                  "  3  Restore previous menu\n"
-                  "  0  Back")
-            choice = input("Select: ").strip()
-            if choice in ("", "0"):
-                return
-            try:
-                if choice == "1":
-                    print("Checking GitHub release…", flush=True)
-                    revision = latest()
-                    menu = release_menu(revision)
-                    print("Latest revision:", revision[:12])
-                    if MENU.read_bytes() == menu:
-                        print("Management menu is already up to date.")
-                    elif input("Update menu only? Type YES: ") == "YES":
-                        install_menu(menu, revision)
-                elif choice == "2":
-                    print("This briefly interrupts web API requests only. VPN services stay running.")
-                    if input("Update and restart ONLY the web API? Type YES: ") == "YES":
-                        update_api(latest())
-                elif choice == "3":
-                    if input("Restore the previous menu only? Type YES: ") == "YES":
-                        rollback()
-            except (ValueError, OSError, KeyError, IndexError, subprocess.SubprocessError) as exc:
-                print("Update failed:", exc)
-                print("Do not rerun server setup. Review the error before retrying.")
+        print("Checking for the latest script…", flush=True)
+        revision = latest()
+        menu = release_menu(revision)
+        print("Latest revision:", revision[:12])
+        if MENU.read_bytes() == menu:
+            print("Script is already up to date. Nothing changed.")
+        elif args.menu_only or input("Upgrade script? Type YES: ") == "YES":
+            install_menu(menu, revision)
+        else:
+            print("Upgrade cancelled. Nothing changed.")
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ class UpdaterTests(unittest.TestCase):
                     updater.release_menu("a" * 40)
         self.assertEqual(updater.MENU.read_bytes(), OLD)
 
-    def test_update_backup_permissions_and_rollback(self):
+    def test_update_backup_permissions_and_noop(self):
         real_run = subprocess.run
         commands = []
         def run(argv, **kwargs):
@@ -66,8 +66,7 @@ class UpdaterTests(unittest.TestCase):
             self.assertEqual(updater.MENU.stat().st_mode & 0o777, 0o755)
             updater.install_menu(NEW, "a" * 40)
             self.assertEqual((updater.STATE / "previous-menu").read_bytes(), OLD)
-            updater.rollback()
-        self.assertEqual(updater.MENU.read_bytes(), OLD)
+        self.assertEqual(updater.MENU.read_bytes(), NEW)
         self.assertTrue(commands)
 
     def test_invalid_menu_or_failed_download_preserves_installed_file(self):
@@ -101,46 +100,41 @@ class UpdaterTests(unittest.TestCase):
                 updater.install_menu(NEW, "a" * 40)
         self.assertEqual(updater.MENU.read_bytes(), OLD)
 
-    def test_api_downloads_one_revision_and_calls_only_api_updater(self):
+    def test_direct_upgrade_has_one_confirmation_and_no_extra_actions(self):
+        with patch.object(updater.sys, "argv", ["update-script.py"]), \
+             patch.object(updater.os, "geteuid", return_value=0), \
+             patch.object(updater, "latest", return_value="a" * 40), \
+             patch.object(updater, "release_menu", return_value=NEW), \
+             patch("builtins.input", return_value="YES") as prompt:
+            updater.main()
+            prompt.assert_called_once_with("Upgrade script? Type YES: ")
+        self.assertEqual(updater.MENU.read_bytes(), NEW)
+        self.assertFalse(hasattr(updater, "update_api"))
+        self.assertFalse(hasattr(updater, "rollback"))
+
+    def test_decline_and_already_current_leave_script_unchanged(self):
+        for available, answer in ((NEW, "no"), (OLD, "YES")):
+            with patch.object(updater.sys, "argv", ["update-script.py"]), \
+                 patch.object(updater.os, "geteuid", return_value=0), \
+                 patch.object(updater, "latest", return_value="a" * 40), \
+                 patch.object(updater, "release_menu", return_value=available), \
+                 patch("builtins.input", return_value=answer) as prompt:
+                updater.main()
+                if available == OLD:
+                    prompt.assert_not_called()
+            self.assertEqual(updater.MENU.read_bytes(), OLD)
+            self.assertFalse(updater.STATE.exists())
+
+    def test_preserves_installed_api_account_locking_without_modifying_api(self):
         updater.API_CONFIG.write_text("{}")
-        source = Path("scripts/node-api/install.sh").read_bytes()
-        revision = "b" * 40
-        def download(path, ref):
-            self.assertEqual(ref, revision)
-            return source if path.endswith("install.sh") else Path(path).read_bytes()
-        def run(argv, **kwargs):
-            self.assertEqual(argv[1:], ["-m", "vpn_node_api.control", "update"])
-            root = Path(kwargs["env"]["PYTHONPATH"])
-            self.assertTrue((root / "vpn_node_api/native.py").is_file())
-            self.assertFalse((root / "install.sh").exists())
-        with patch.object(updater, "download", side_effect=download), \
-             patch.object(updater.subprocess, "run", side_effect=run) as command:
-            updater.update_api(revision)
-            command.assert_called_once()
+        # Use the real coordination helper without running any API action.
+        with patch.object(updater, "API_HOME", Path("scripts/node-api").resolve()), \
+             patch.object(updater, "download", return_value=Path("scripts/ssh-ssl-setup.sh").read_bytes()):
+            menu = updater.release_menu("a" * 40)
+        self.assertIn(b"node_api_account_lock()", menu)
+        self.assertIn(b"node_api_account_lock create_user", menu)
+        self.assertEqual(updater.API_CONFIG.read_text(), "{}")
         self.assertEqual(updater.MENU.read_bytes(), OLD)
-
-    def test_api_checksum_failure_never_runs_update(self):
-        updater.API_CONFIG.write_text("{}")
-        def download(path, ref):
-            if path.endswith("install.sh"):
-                return Path(path).read_bytes()
-            return b"# corrupt download"
-        with patch.object(updater, "download", side_effect=download), \
-             patch.object(updater.subprocess, "run") as command:
-            with self.assertRaises(ValueError):
-                updater.update_api("a" * 40)
-            command.assert_not_called()
-
-    def test_current_api_never_restarts(self):
-        updater.API_CONFIG.write_text("{}")
-        installed = updater.API_HOME / "vpn_node_api"
-        installed.mkdir(parents=True)
-        for source in Path("scripts/node-api/vpn_node_api").glob("*.py"):
-            (installed / source.name).write_bytes(source.read_bytes())
-        with patch.object(updater, "download", side_effect=lambda path, ref: Path(path).read_bytes()), \
-             patch.object(updater.subprocess, "run") as command:
-            updater.update_api("a" * 40)
-            command.assert_not_called()
 
 
 if __name__ == "__main__":
