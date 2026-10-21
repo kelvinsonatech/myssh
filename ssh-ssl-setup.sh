@@ -4472,6 +4472,7 @@ node_api_menu() {
         echo "  4  Disable API only"
         echo "  5  Allowed IPs / whitelist"
         echo "  6  Update script"
+        echo "  7  Multi-login limiter"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4501,8 +4502,822 @@ node_api_menu() {
                 fi
                 pause;;
             6) script_update_menu;;
+            7) limiter_menu;;
             0|"") return;;
             *) err "Invalid option.";;
+        esac
+    done
+}
+
+# ── Multi-login limiter (Website API menu only) ─────────────────────────
+# Separate background checker. Reads login sessions; closes or locks only the
+# offending account. Never restarts or edits SSH/Dropbear/SSL/WS/SlowDNS.
+LIM_DIR=/usr/local/lib/vpn-login-limiter
+LIM_PY=$LIM_DIR/limiter.py
+LIM_UNIT=/etc/systemd/system/vpn-login-limiter.service
+LIM_LOG=/var/log/vpn-login-limiter-setup.log
+
+lim_installed() { [ -f "$LIM_PY" ]; }
+lim_active() { systemctl is-active --quiet vpn-login-limiter 2>/dev/null; }
+lim_get() { python3 "$LIM_PY" get "$1" 2>/dev/null; }
+
+lim_step() (
+    # lim_step ICON "TITLE" "n/4" command...  — animated shield scanner.
+    local icon="$1" title="$2" count="$3" spinner="" result start=$SECONDS width track; shift 3
+    trap '[ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; }; printf "\r\033[K\033[?25h"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [ -t 1 ]; then
+        width=$(tput cols 2>/dev/null) || width=40
+        [[ "$width" =~ ^[0-9]+$ ]] || width=40
+        track=$((width-22)); (( track > 20 )) && track=20
+        (( track < 6 )) && track=6
+        printf '\n  \033[38;5;213m%s\033[0m  \033[1m%s\033[0m  \033[38;5;99m%s\033[0m\n' "$icon" "$title" "$count"
+        printf '\033[?25l'
+        (local frame=0 elapsed cell bar wave pos
+        local -a orbit=('◐' '◓' '◑' '◒')
+        local -a shades=(213 207 171 135 99 63 61 60 59 238)
+        while :; do
+            elapsed=$((SECONDS-start)); bar=""
+            pos=$((frame % (track*2)))
+            (( pos >= track )) && pos=$((track*2-pos-1))
+            for ((cell=0; cell<track; cell++)); do
+                wave=$(( cell>pos ? cell-pos : pos-cell ))
+                (( wave > 9 )) && wave=9
+                if (( wave == 0 )); then bar+="\033[38;5;225m◆"
+                elif (( wave < 4 )); then bar+="\033[38;5;${shades[$wave]}m▰"
+                else bar+="\033[38;5;${shades[$wave]}m▱"; fi
+            done
+            printf '\r\033[K  \033[38;5;213m%s\033[0m  %b\033[0m  \033[2m%02d:%02d\033[0m' \
+                "${orbit[$((frame % 4))]}" "$bar" "$((elapsed/60))" "$((elapsed%60))"
+            frame=$((frame+1)); sleep 0.08
+        done) &
+        spinner=$!
+    else
+        printf '  %s %s\n' "$count" "$title"
+    fi
+    "$@" >>"$LIM_LOG" 2>&1
+    result=$?
+    [ -z "$spinner" ] || { kill "$spinner" 2>/dev/null || true; wait "$spinner" 2>/dev/null || true; spinner=""; }
+    if [ -t 1 ]; then
+        if [ "$result" = 0 ]; then
+            printf '\r\033[K  \033[38;5;118m✔ READY\033[0m  \033[2m%ss\033[0m\n' "$((SECONDS-start))"
+        else
+            printf '\r\033[K  \033[1;31m✘ STOPPED\033[0m — see %s\n' "$LIM_LOG"
+        fi
+    elif [ "$result" = 0 ]; then printf '  [OK]\n'
+    else printf '  [FAILED] see %s\n' "$LIM_LOG"; fi
+    exit "$result"
+)
+
+lim_check() {
+    local tool missing=""
+    for tool in python3 journalctl usermod userdel chage systemctl; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=" $tool"
+    done
+    [ -z "$missing" ] || { echo "Missing:$missing"; return 1; }
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 6))' || { echo "Python 3.6+ required"; return 1; }
+}
+
+lim_write_engine() {
+    mkdir -p "$LIM_DIR" || return 1
+    local tmp; tmp=$(mktemp "$LIM_DIR/.limiter.XXXXXX") || return 1
+    cat > "$tmp" <<'LIMITERPY'
+#!/usr/bin/env python3
+"""Multi-login limiter for SSH, SSH-SSL and SlowDNS accounts.
+
+Counts each account's live logins (OpenSSH and Dropbear). When an account
+stays above its limit, only that account's OLDEST sessions are closed, so a
+reconnecting user keeps the new session. Repeated overuse locks the account;
+optional delayed deletion follows. Never restarts or reconfigures a VPN service.
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+DEFAULTS = {"enabled": False, "mode": "watch", "limit": 4, "overrides": {},
+            "interval": 20, "grace": 60, "strikes": 3, "window": 600,
+            "delete_after": 60}
+RANGES = {"limit": (1, 50), "interval": (5, 300), "grace": (0, 3600),
+          "strikes": (1, 20), "window": (60, 86400), "delete_after": (0, 10080)}
+SHELLS = ("/bin/false", "/usr/sbin/nologin")
+AUTH = re.compile(r"(?:Password|Pubkey) auth succeeded for '([^']+)'")
+API_TAG = "vpn-node="
+EMPTY_STATE = {"over": {}, "strikes": {}, "watch": {}, "locked": {}, "pending": []}
+
+
+class Busy(Exception):
+    """Another account operation holds the shared lock; retry next cycle."""
+
+
+def atomic(path, text, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def validate(cfg):
+    merged = {**DEFAULTS, **cfg}
+    for key, (low, high) in RANGES.items():
+        value = merged[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise ValueError(f"{key} must be a whole number from {low} to {high}")
+    if merged["mode"] not in ("watch", "enforce"):
+        raise ValueError("mode must be watch or enforce")
+    if not isinstance(merged["enabled"], bool):
+        raise ValueError("enabled must be true or false")
+    overrides = merged["overrides"]
+    if not isinstance(overrides, dict) or not all(
+            isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+            and 1 <= v <= 50 for k, v in overrides.items()):
+        raise ValueError("per-account limits must be 1 to 50")
+    return merged
+
+
+class Limiter:
+    def __init__(self, root="/", now=time.time, kill=os.kill, run=None):
+        base = Path(root)
+        self.proc = base / "proc"
+        self.passwd = base / "etc/passwd"
+        self.shadow = base / "etc/shadow"
+        self.config_path = base / "etc/vpn-login-limiter/config.json"
+        self.state_path = base / "var/lib/vpn-login-limiter/state.json"
+        self.log_path = base / "var/log/vpn-login-limiter.log"
+        self.account_lock_path = base / "run/lock/vpn-node-accounts.lock"
+        self.state_lock_path = base / "run/lock/vpn-login-limiter.lock"
+        self.now, self.kill = now, kill
+        self.run = run or self._run
+        self.cache, self.tries = {}, {}
+        self.state = json.loads(json.dumps(EMPTY_STATE))
+        self.good_config = None
+        self.last_error = None
+
+    # ── infrastructure ───────────────────────────────────────────────
+    @staticmethod
+    def _run(argv, timeout=20):
+        return subprocess.run(argv, check=True, text=True, capture_output=True, timeout=timeout)
+
+    def log(self, message):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.now()))
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if self.log_path.stat().st_size > 1024 * 1024:
+                os.replace(self.log_path, self.log_path.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        with self.log_path.open("a") as stream:
+            stream.write(f"[{stamp}] {message}\n")
+
+    def config(self):
+        try:
+            raw = json.loads(self.config_path.read_text())
+            self.good_config = validate(raw)
+        except FileNotFoundError:
+            self.good_config = dict(DEFAULTS)
+        except (ValueError, OSError) as exc:
+            if self.good_config is None:
+                raise
+            self.error("config", exc)   # keep running with last valid settings
+        return self.good_config
+
+    def save_config(self, cfg):
+        cfg = validate(cfg)
+        atomic(self.config_path, json.dumps(cfg, indent=2) + "\n", 0o600)
+        return cfg
+
+    def error(self, kind, exc):
+        text = f"{kind}: {exc}"
+        if text != self.last_error:          # log each distinct problem once
+            self.last_error = text
+            self.log("warning " + text)
+
+    @contextlib.contextmanager
+    def state_lock(self):
+        self.state_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.state_lock_path, "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                try:
+                    loaded = json.loads(self.state_path.read_text())
+                    self.state = {**json.loads(json.dumps(EMPTY_STATE)), **loaded}
+                except FileNotFoundError:
+                    self.state = json.loads(json.dumps(EMPTY_STATE))
+                except ValueError:
+                    os.replace(self.state_path, self.state_path.with_suffix(".corrupt"))
+                    self.state = json.loads(json.dumps(EMPTY_STATE))
+                    self.log("warning state file unreadable; saved a copy and started fresh")
+                yield self.state
+                atomic(self.state_path, json.dumps(self.state, indent=1, sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def account_lock(self):
+        """Same lock as menu/API account operations: never race a create/delete."""
+        self.account_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.account_lock_path, "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Busy()
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    # ── discovery ────────────────────────────────────────────────────
+    def accounts(self):
+        result = {}
+        for line in self.passwd.read_text().splitlines():
+            fields = line.split(":")
+            if len(fields) < 7 or not fields[2].isdigit():
+                continue
+            if int(fields[2]) >= 1000 and fields[6] in SHELLS:
+                result[fields[0]] = {"uid": int(fields[2]), "api": fields[4].startswith(API_TAG)}
+        return result
+
+    def password_locked(self, user):
+        for line in self.shadow.read_text().splitlines():
+            fields = line.split(":")
+            if fields[0] == user and len(fields) > 1:
+                return fields[1].startswith("!")
+        return False
+
+    def process(self, pid):
+        entry = self.proc / str(pid)
+        try:
+            stat = (entry / "stat").read_text()
+            status = (entry / "status").read_text()
+        except OSError:
+            return None
+        end = stat.rfind(")")
+        comm = stat[stat.find("(") + 1:end]
+        fields = stat[end + 2:].split()
+        uid = next(int(l.split()[1]) for l in status.splitlines() if l.startswith("Uid:"))
+        return comm, int(fields[1]), int(fields[19]), uid
+
+    def processes(self):
+        table = {}
+        for entry in self.proc.iterdir():
+            if entry.name.isdigit():
+                info = self.process(int(entry.name))
+                if info:
+                    table[int(entry.name)] = info
+        return table
+
+    def epoch(self, start):
+        if not hasattr(self, "_boot"):
+            self._boot = next(int(l.split()[1]) for l in (self.proc / "stat").read_text().splitlines()
+                              if l.startswith("btime"))
+            self._hz = os.sysconf("SC_CLK_TCK")
+        return self._boot + start / self._hz
+
+    def resolve_dropbear(self, pending):
+        """Map Dropbear connection PIDs to accounts using their own auth log line."""
+        if not pending:
+            return
+        since = int(min(self.epoch(start) for _, start in pending)) - 5
+        found = {}
+        try:
+            output = self.run(["journalctl", "-b", "--no-pager", "-o", "json",
+                               "--output-fields=_PID,MESSAGE", "_COMM=dropbear",
+                               "--since", f"@{since}"]).stdout
+        except Exception as exc:          # journal unavailable: count nothing, kill nothing
+            self.error("journal", exc)
+            output = ""
+        for line in output.splitlines():
+            try:
+                item = json.loads(line)
+                match = AUTH.search(item["MESSAGE"]) if isinstance(item.get("MESSAGE"), str) else None
+                if match:
+                    found.setdefault(int(item["_PID"]), []).append(
+                        (int(item["__REALTIME_TIMESTAMP"]) / 1e6, match.group(1)))
+            except (ValueError, KeyError, TypeError):
+                continue
+        now = self.now()
+        for key in pending:
+            pid, start = key
+            began = self.epoch(start)
+            # Ignore lines from an older process that had the same PID.
+            names = [user for stamp, user in found.get(pid, []) if stamp >= began - 2]
+            if names:
+                self.cache[key] = names[-1]
+            else:
+                self.tries[key] = self.tries.get(key, 0) + 1
+                if self.tries[key] >= 3 and now - began > 120:
+                    self.cache[key] = None   # never authenticated: never counted
+
+    def sessions(self, accounts=None):
+        accounts = accounts if accounts is not None else self.accounts()
+        by_uid = {info["uid"]: user for user, info in accounts.items()}
+        table = self.processes()
+        result, dropbear = {}, []
+        for pid, (comm, ppid, start, uid) in table.items():
+            if comm in ("sshd", "sshd-session") and uid in by_uid:
+                # OpenSSH: the per-connection unprivileged child runs as the user.
+                # The listener runs as root, so it can never match.
+                result.setdefault(by_uid[uid], []).append([start, pid, "openssh"])
+            elif comm == "dropbear" and uid == 0 and table.get(ppid, ("",))[0] == "dropbear":
+                dropbear.append((pid, start))     # connection child, never the listener
+        self.resolve_dropbear([k for k in dropbear if k not in self.cache])
+        alive = set(dropbear)
+        for key in list(self.cache):
+            if key not in alive:
+                self.cache.pop(key, None)
+                self.tries.pop(key, None)
+        for pid, start in dropbear:
+            user = self.cache.get((pid, start))
+            if user in accounts:
+                result.setdefault(user, []).append([start, pid, "dropbear"])
+        for items in result.values():
+            items.sort()
+        return result
+
+    # ── actions ──────────────────────────────────────────────────────
+    def close(self, session, user, accounts):
+        start, pid, kind = session
+        info = self.process(pid)
+        if not info or info[2] != start:
+            return False                     # already gone or PID reused
+        comm, ppid, _, uid = info
+        if kind == "openssh":
+            safe = comm in ("sshd", "sshd-session") and uid == accounts[user]["uid"]
+        else:
+            parent = self.process(ppid)
+            safe = comm == "dropbear" and uid == 0 and parent and parent[0] == "dropbear"
+        if not safe:
+            self.log(f"skipped unexpected process {pid} for {user}")
+            return False
+        try:
+            self.kill(pid, signal.SIGTERM)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def penalize(self, user, cfg, accounts):
+        with self.account_lock():
+            if user not in self.accounts():
+                return
+            pre_locked = self.password_locked(user)
+            if not pre_locked:
+                self.run(["usermod", "-L", user])
+            closed = sum(self.close(s, user, accounts) for s in self.sessions(accounts).get(user, []))
+            self.state["locked"][user] = {"at": self.now(), "pre_locked": pre_locked,
+                                          "api": accounts[user]["api"]}
+            self.state["strikes"].pop(user, None)
+            self.state["over"].pop(user, None)
+            when = (f"deletion in {cfg['delete_after']} min" if cfg["delete_after"]
+                    else "kept locked until you unlock it")
+            self.log(f"LOCKED {user}: repeated logins above limit; closed {closed} session(s); {when}")
+
+    def deletions(self, cfg, accounts):
+        if cfg["mode"] != "enforce" or not cfg["delete_after"]:
+            return
+        now = self.now()
+        for user, info in list(self.state["locked"].items()):
+            if info.get("deleted") or now < info["at"] + cfg["delete_after"] * 60:
+                continue
+            if user not in accounts:
+                self.state["locked"].pop(user)
+                continue
+            if not self.password_locked(user):
+                self.state["locked"].pop(user)
+                self.log(f"{user} was unlocked outside the limiter; deletion cancelled")
+                continue
+            try:
+                with self.account_lock():
+                    for session in self.sessions(accounts).get(user, []):
+                        self.close(session, user, accounts)
+                    if info["api"]:
+                        # Website account: revoke but keep the UID so the API record stays valid.
+                        self.run(["chage", "-E", "1970-01-02", user])
+                        info["deleted"] = now
+                    else:
+                        self.run(["userdel", "-f", user])
+                        self.state["locked"].pop(user)
+                    self.log(f"DELETED {user} after repeated multi-login abuse"
+                             + (" (website account revoked)" if info["api"] else ""))
+            except Busy:
+                pass
+
+    def cycle(self):
+        cfg = self.config()
+        now = self.now()
+        accounts = self.accounts()
+        enforce = cfg["mode"] == "enforce"
+        live = self.sessions(accounts)
+        st = self.state
+        for user in list(st["over"]):
+            if user not in live:
+                st["over"].pop(user)
+        for user in list(st["pending"]):
+            if user not in accounts or user in st["locked"] or not enforce:
+                st["pending"].remove(user)
+                continue
+            try:
+                self.penalize(user, cfg, accounts)
+                st["pending"].remove(user)
+            except Busy:
+                pass
+        for user, items in live.items():
+            if user in st["locked"] or user in st["pending"]:
+                continue
+            limit = cfg["overrides"].get(user, cfg["limit"])
+            if len(items) <= limit:
+                st["over"].pop(user, None)
+                continue
+            first = st["over"].setdefault(user, now)
+            if now - first < cfg["grace"]:
+                continue                       # reconnect overlap: wait it out
+            st["over"].pop(user, None)
+            excess = items[:len(items) - limit]   # oldest first; newest kept
+            book = st["strikes"] if enforce else st["watch"]
+            strikes = [t for t in book.get(user, []) if now - t < cfg["window"]] + [now]
+            book[user] = strikes
+            if not enforce:
+                self.log(f"WATCH {user}: {len(items)}/{limit} logins — would close "
+                         f"{len(excess)} oldest")
+                if len(strikes) >= cfg["strikes"]:
+                    self.log(f"WATCH {user}: would LOCK (repeated {len(strikes)}x in "
+                             f"{cfg['window'] // 60} min)")
+                    book.pop(user)
+                continue
+            closed = sum(self.close(s, user, accounts) for s in excess)
+            self.log(f"LIMIT {user}: {len(items)}/{limit} logins — closed {closed} oldest "
+                     f"(strike {len(strikes)}/{cfg['strikes']})")
+            if len(strikes) >= cfg["strikes"]:
+                try:
+                    self.penalize(user, cfg, accounts)
+                except Busy:
+                    st["pending"].append(user)
+        for book in (st["strikes"], st["watch"]):
+            for user in list(book):
+                book[user] = [t for t in book[user] if now - t < cfg["window"]]
+                if not book[user]:
+                    book.pop(user)
+        self.deletions(cfg, accounts)
+        return live
+
+    def daemon(self):
+        stop = []
+        signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+        self.log("limiter started")
+        while not stop:
+            interval = 20
+            try:
+                cfg = self.config()
+                interval = cfg["interval"]
+                if cfg["enabled"]:
+                    with self.state_lock():
+                        self.cycle()
+            except Exception as exc:          # stay alive; never touch services
+                self.error("cycle", exc)
+            for _ in range(interval * 2):
+                if stop:
+                    break
+                time.sleep(0.5)
+        self.log("limiter stopped")
+
+    def unlock(self, user):
+        with self.state_lock() as st, self.account_lock():
+            info = st["locked"].get(user)
+            if not info:
+                raise ValueError(f"{user} is not locked by the limiter")
+            if info.get("deleted"):
+                raise ValueError(f"{user} was already removed")
+            if not info["pre_locked"] and user in self.accounts():
+                self.run(["usermod", "-U", user])
+            for book in ("locked", "strikes", "watch", "over"):
+                st[book].pop(user, None)
+            if user in st["pending"]:
+                st["pending"].remove(user)
+            self.log(f"UNLOCKED {user} by administrator")
+
+
+# ── terminal output ──────────────────────────────────────────────────
+TTY = sys.stdout.isatty()
+
+
+def paint(code, text):
+    return f"\033[{code}m{text}\033[0m" if TTY else text
+
+
+def show_status(limiter):
+    cfg = limiter.config()
+    accounts = limiter.accounts()
+    live = limiter.sessions(accounts)
+    with limiter.state_lock() as st:
+        locked = dict(st["locked"])
+    print(paint("38;5;213;1", "  LIVE CONNECTIONS") + paint("2", "  (SSH · SSH-SSL · SlowDNS)"))
+    print(paint("2", "  " + "─" * 44))
+    print(paint("2", f"  {'ACCOUNT':<20}{'LOGINS':>8}{'LIMIT':>8}  STATE"))
+    rows = sorted(set(live) | set(locked))
+    if not rows:
+        print(paint("2", "  nobody connected right now"))
+    for user in rows:
+        count = len(live.get(user, []))
+        limit = cfg["overrides"].get(user, cfg["limit"])
+        if user in locked:
+            state = paint("1;31", "removed" if locked[user].get("deleted") else "locked")
+        elif count > limit:
+            state = paint("38;5;208", "over limit")
+        else:
+            state = paint("38;5;118", "ok")
+        mark = "*" if user in cfg["overrides"] else " "
+        print(f"  {user:<20}{count:>8}{limit:>7}{mark}  {state}")
+    total = sum(len(v) for v in live.values())
+    print(paint("2", "  " + "─" * 44))
+    print(f"  {paint('1', str(total))} login(s) across {paint('1', str(len(live)))} account(s)"
+          + paint("2", "   * custom limit"))
+
+
+def show_locked(limiter):
+    cfg = limiter.config()
+    with limiter.state_lock() as st:
+        locked = dict(st["locked"])
+    if not locked:
+        print(paint("38;5;118", "  No accounts are locked."))
+        return
+    for user, info in sorted(locked.items()):
+        since = time.strftime("%Y-%m-%d %H:%M", time.localtime(info["at"]))
+        if info.get("deleted"):
+            detail = "website account revoked"
+        elif cfg["delete_after"] and cfg["mode"] == "enforce":
+            left = max(0, int(info["at"] + cfg["delete_after"] * 60 - limiter.now()) // 60)
+            detail = f"deletes in {left} min"
+        else:
+            detail = "locked until unlocked"
+        print(f"  {paint('1;31', '■')} {user:<20} {paint('2', since)}  {detail}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="SSH multi-login limiter")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("run")
+    sub.add_parser("scan")
+    sub.add_parser("status")
+    sub.add_parser("locked")
+    log = sub.add_parser("log")
+    log.add_argument("--lines", type=int, default=25)
+    get = sub.add_parser("get")
+    get.add_argument("key", choices=sorted(DEFAULTS))
+    configure = sub.add_parser("configure")
+    configure.add_argument("--limit", type=int)
+    configure.add_argument("--mode", choices=("watch", "enforce"))
+    configure.add_argument("--delete-after", type=int)
+    configure.add_argument("--enable", action="store_true")
+    configure.add_argument("--disable", action="store_true")
+    override = sub.add_parser("override")
+    override.add_argument("user")
+    override.add_argument("value")
+    unlock = sub.add_parser("unlock")
+    unlock.add_argument("user")
+    args = parser.parse_args(argv)
+    limiter = Limiter()
+    if args.command == "run":
+        limiter.daemon()
+    elif args.command == "scan":
+        live = limiter.sessions()
+        print(f"{sum(len(v) for v in live.values())} login(s) across {len(live)} account(s)")
+    elif args.command == "status":
+        show_status(limiter)
+    elif args.command == "locked":
+        show_locked(limiter)
+    elif args.command == "log":
+        try:
+            lines = limiter.log_path.read_text().splitlines()[-max(1, args.lines):]
+        except FileNotFoundError:
+            lines = []
+        print("\n".join("  " + line for line in lines) if lines else "  No activity yet.")
+    elif args.command == "get":
+        value = limiter.config()[args.key]
+        print(json.dumps(value) if isinstance(value, (dict, bool)) else value)
+    elif args.command == "configure":
+        cfg = dict(limiter.config())
+        if args.limit is not None:
+            cfg["limit"] = args.limit
+        if args.mode:
+            cfg["mode"] = args.mode
+        if args.delete_after is not None:
+            cfg["delete_after"] = args.delete_after
+        if args.enable:
+            cfg["enabled"] = True
+        if args.disable:
+            cfg["enabled"] = False
+        limiter.save_config(cfg)
+    elif args.command == "override":
+        cfg = dict(limiter.config())
+        overrides = dict(cfg["overrides"])
+        if args.value == "clear":
+            overrides.pop(args.user, None)
+        else:
+            if args.user not in limiter.accounts():
+                raise ValueError(f"{args.user} is not an SSH account")
+            overrides[args.user] = int(args.value)
+        cfg["overrides"] = overrides
+        limiter.save_config(cfg)
+    elif args.command == "unlock":
+        limiter.unlock(args.user)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, Busy, OSError, subprocess.SubprocessError) as exc:
+        message = str(exc) or "another account operation is running; retry shortly"
+        print(f"  ✘ {message}", file=sys.stderr)
+        sys.exit(1)
+LIMITERPY
+    python3 -c 'import sys; compile(open(sys.argv[1]).read(), "limiter", "exec")' "$tmp" \
+        || { rm -f "$tmp"; return 1; }
+    chmod 755 "$tmp" && mv -f "$tmp" "$LIM_PY"
+}
+
+lim_install() {
+    lim_write_engine || return 1
+    python3 "$LIM_PY" configure --limit "$1" --mode "$2" --delete-after "$3" --enable || return 1
+    local unit
+    unit='[Unit]
+Description=SSH multi-login limiter (closes only offending sessions)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/vpn-login-limiter/limiter.py run
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target'
+    if [ "$(cat "$LIM_UNIT" 2>/dev/null)" != "$unit" ]; then
+        printf '%s\n' "$unit" > "$LIM_UNIT" || return 1
+    fi
+    # daemon-reload only rereads unit files; it does not restart any service.
+    systemctl daemon-reload
+}
+
+lim_live() {
+    systemctl enable vpn-login-limiter >/dev/null 2>&1 || return 1
+    # Restart ONLY the limiter so a refreshed engine is loaded.
+    systemctl restart vpn-login-limiter || return 1
+    sleep 2
+    systemctl is-active --quiet vpn-login-limiter
+}
+
+lim_mode_label() {
+    if [ "$(lim_get mode)" = enforce ]; then echo -e "${LIME}ENFORCING${NC}"
+    else echo -e "${Y}WATCH-ONLY${NC}"; fi
+}
+
+lim_action_label() {
+    local d; d=$(lim_get delete_after)
+    if [ "${d:-0}" = 0 ]; then echo "lock until you unlock"
+    else echo "lock, delete after ${d} min"; fi
+}
+
+lim_card() {
+    local col="$PINK"
+    echo ""
+    line_top "$col"
+    crow "$col" "${PINK}${BOLD}⛨  MULTI-LOGIN LIMITER${NC}"
+    if lim_active; then crow "$col" "${LIME}● ACTIVE${NC}"; else crow "$col" "${GR}○ OFF${NC}"; fi
+    line_mid "$col"
+    row "$col" "${GR}Limit${NC}     ${W}$(lim_get limit) connections per account${NC}"
+    row "$col" "${GR}Mode${NC}      $(lim_mode_label)"
+    row "$col" "${GR}Abuse${NC}     ${W}$(lim_action_label)${NC}"
+    row "$col" "${GR}Covers${NC}    ${W}SSH · SSH-SSL · SlowDNS${NC}"
+    line_bot "$col"
+}
+
+lim_ask_number() {  # lim_ask_number "Prompt" default min max  → echoes value
+    local value
+    read -rp "$(echo -e "  ${C}$1${NC} [${W}$2${NC}]: ")" value
+    value=${value:-$2}
+    if [[ "$value" =~ ^[0-9]+$ ]] && (( 10#$value >= $3 && 10#$value <= $4 )); then
+        echo $((10#$value))
+    else
+        return 1
+    fi
+}
+
+lim_activate() {
+    local limit mode delay pick
+    section "ACTIVATE MULTI-LOGIN LIMITER" "$PINK"
+    note "Covers SSH, SSH-SSL and SlowDNS accounts. No VPN service is restarted."
+    note "Reconnects are safe: the OLDEST session is closed, the newest kept."
+    echo ""
+    limit=$(lim_ask_number "Connections per account" 4 1 50) \
+        || { err "Enter a number from 1 to 50."; pause; return; }
+    echo -e "  ${C}Mode${NC}"
+    echo -e "    ${W}1${NC}  Enforce ${GR}— act on over-limit accounts${NC}"
+    echo -e "    ${W}2${NC}  Watch-only ${GR}— only log what it would do (good for day one)${NC}"
+    read -rp "$(echo -e "  ${C}Select${NC} [${W}1${NC}]: ")" pick
+    case "${pick:-1}" in 1) mode=enforce;; 2) mode=watch;; *) err "Invalid mode."; pause; return;; esac
+    delay=$(lim_ask_number "Delete repeat abusers after minutes (0 = lock only)" 60 0 10080) \
+        || { err "Enter minutes from 0 to 10080."; pause; return; }
+    : > "$LIM_LOG" 2>/dev/null || true
+    lim_step "◈" "SERVER CHECK" "1/4" lim_check || { pause; return; }
+    lim_step "⛨" "LIMITER ENGINE" "2/4" lim_install "$limit" "$mode" "$delay" || { pause; return; }
+    lim_step "◎" "SESSION SCAN" "3/4" python3 "$LIM_PY" scan || { pause; return; }
+    lim_step "⚡" "GOING LIVE" "4/4" lim_live || {
+        systemctl disable --now vpn-login-limiter >/dev/null 2>&1 || true
+        python3 "$LIM_PY" configure --disable >/dev/null 2>&1 || true
+        err "Limiter could not start; it was switched off. VPN services untouched."
+        pause; return; }
+    lim_card
+    echo -e "  ${GR}$(python3 "$LIM_PY" scan 2>/dev/null) online now${NC}"
+    pause
+}
+
+lim_deactivate() {
+    read -rp "$(echo -e "  ${Y}Turn the limiter off? type YES${NC}: ")" pick
+    [ "$pick" = YES ] || return
+    systemctl disable --now vpn-login-limiter >/dev/null 2>&1 || true
+    python3 "$LIM_PY" configure --disable >/dev/null 2>&1 || true
+    ok "Limiter off. No logins are checked; VPN services untouched."
+    note "Already-locked accounts stay locked until you unlock them (option 7)."
+    pause
+}
+
+limiter_menu() {
+    local choice value user
+    while :; do
+        section "MULTI-LOGIN LIMITER" "$PINK"
+        if lim_installed && lim_active; then
+            echo -e "  ${LIME}●${NC} ${W}${BOLD}ACTIVE${NC}  ${GR}·${NC} $(lim_mode_label)  ${GR}·${NC} ${W}$(lim_get limit)${NC} ${GR}per account${NC}"
+        else
+            echo -e "  ${GR}○ OFF${NC}  ${GR}Limit logins per SSH / SSH-SSL / SlowDNS account${NC}"
+        fi
+        echo ""
+        if lim_active; then
+            echo -e "  ${PINK}1${NC}  ⏻  Turn off"
+        else
+            echo -e "  ${PINK}1${NC}  ⛨  Activate"
+        fi
+        echo -e "  ${PINK}2${NC}  #  Connection limit (all accounts)"
+        echo -e "  ${PINK}3${NC}  ✎  Limit for one account"
+        echo -e "  ${PINK}4${NC}  ◐  Mode: enforce / watch-only"
+        echo -e "  ${PINK}5${NC}  ⚑  Abuse action (lock / delete delay)"
+        echo -e "  ${PINK}6${NC}  ◉  Live connections"
+        echo -e "  ${PINK}7${NC}  ■  Locked accounts / unlock"
+        echo -e "  ${PINK}8${NC}  ≡  Activity log"
+        echo -e "  ${PINK}0${NC}  ↩  Back"
+        read -rp "  Select: " choice
+        case "$choice" in
+            1) if lim_active; then lim_deactivate; else lim_activate; fi; continue;;
+            0|"") return;;
+        esac
+        if ! lim_installed; then err "Activate the limiter first (option 1)."; pause; continue; fi
+        case "$choice" in
+            2) value=$(lim_ask_number "Connections per account" "$(lim_get limit)" 1 50) \
+                   && python3 "$LIM_PY" configure --limit "$value" \
+                   && ok "Limit set to ${W}$value${NC}. Applies within seconds; nothing restarted." \
+                   || err "Enter a number from 1 to 50."; pause;;
+            3) read -rp "$(echo -e "  ${C}Username${NC}: ")" user
+               value=$(lim_ask_number "Connections for $user (0 = use default)" 0 0 50) \
+                   || { err "Enter a number from 0 to 50."; pause; continue; }
+               if [ "$value" = 0 ]; then
+                   python3 "$LIM_PY" override "$user" clear && ok "$user now uses the default limit."
+               else
+                   python3 "$LIM_PY" override "$user" "$value" && ok "$user limited to ${W}$value${NC}."
+               fi; pause;;
+            4) echo -e "    ${W}1${NC}  Enforce   ${W}2${NC}  Watch-only"
+               read -rp "  Select: " value
+               case "$value" in
+                   1) python3 "$LIM_PY" configure --mode enforce && ok "Enforcing.";;
+                   2) python3 "$LIM_PY" configure --mode watch && ok "Watch-only: actions are logged, not taken.";;
+                   *) err "Invalid option.";;
+               esac; pause;;
+            5) value=$(lim_ask_number "Delete repeat abusers after minutes (0 = lock only)" "$(lim_get delete_after)" 0 10080) \
+                   && python3 "$LIM_PY" configure --delete-after "$value" \
+                   && ok "Abuse action: $(lim_action_label)." \
+                   || err "Enter minutes from 0 to 10080."; pause;;
+            6) section "LIVE CONNECTIONS" "$PINK"; python3 "$LIM_PY" status; pause;;
+            7) section "LOCKED ACCOUNTS" "$PINK"; python3 "$LIM_PY" locked
+               read -rp "$(echo -e "  ${C}Username to unlock (blank = back)${NC}: ")" user
+               [ -z "$user" ] || { python3 "$LIM_PY" unlock "$user" && ok "$user unlocked."; }
+               pause;;
+            8) section "LIMITER ACTIVITY" "$PINK"; python3 "$LIM_PY" log; pause;;
+            *) err "Invalid option."; pause;;
         esac
     done
 }
