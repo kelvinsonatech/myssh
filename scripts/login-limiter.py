@@ -353,7 +353,14 @@ class Limiter:
             except Busy:
                 pass
         for user, items in live.items():
-            if user in st["locked"] or user in st["pending"]:
+            if user in st["locked"]:
+                # A login that slipped in around the lock (or a key login) is closed too.
+                if enforce and not st["locked"][user].get("deleted") and self.password_locked(user):
+                    closed = sum(self.close(s, user, accounts) for s in items)
+                    if closed:
+                        self.log(f"closed {closed} login(s) on locked account {user}")
+                continue
+            if user in st["pending"]:
                 continue
             limit = cfg["overrides"].get(user, cfg["limit"])
             if len(items) <= limit:

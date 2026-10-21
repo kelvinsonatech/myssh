@@ -196,6 +196,18 @@ class LimiterTests(unittest.TestCase):
         self.assertIn("alice", box.limiter.state["locked"])
         self.assertTrue(box.shadow["alice"].startswith("!"))
 
+    def test_logins_reaching_a_locked_account_are_closed(self):
+        box = self.box
+        self.share(3, delete_after=0)
+        box.ssh(400, "alice")                       # slipped in around the lock
+        box.cycle(advance=20)
+        self.assertIn(401, box.killed)
+        box.shadow["alice"] = "$6$reset"            # admin unlocked outside the menu
+        box.write_accounts()
+        box.ssh(410, "alice")
+        box.cycle(advance=20)
+        self.assertNotIn(411, box.killed)
+
     def test_delete_after_delay_for_menu_account(self):
         box = self.box
         self.share(3, delete_after=60)
