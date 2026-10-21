@@ -16,6 +16,7 @@ import tempfile
 import urllib.request
 
 from .common import account_lock, atomic, write_json
+from . import access
 
 CONFIG = Path("/etc/vpn-node-api/config.json")
 HOME = Path("/opt/vpn-node-api")
@@ -108,6 +109,19 @@ node_api_menu() {
         text = text.replace("\nwhile true; do\n    banner\n", helper + "\nwhile true; do\n    banner\n")
         text = text.replace(marker, marker + '\n    menu_item "17" "◇" "Website API (HTTPS)" "$SKY"')
         text = text.replace(branch, branch + "\n        17) node_api_menu ;;")
+    # Extend either the old installed submenu or the latest source submenu.
+    if "node_api_menu() {" in text:
+        start = text.index("node_api_menu() {")
+        end = text.index("\n}\n", start) + 3
+        block = text[start:end]
+        if "vpn-node-api whitelist" not in block:
+            block = block.replace('        echo "  0  Back"',
+                                  '        echo "  5  Allowed IPs / whitelist"\n        echo "  0  Back"')
+            block = block.replace('            0|"") return;;',
+                                  '            5) /usr/local/bin/vpn-node-api whitelist; pause;;\n            0|"") return;;')
+            if "vpn-node-api whitelist" not in block:
+                raise ValueError("Cannot safely extend the API submenu")
+            text = text[:start] + block + text[end:]
     return text
 
 
@@ -171,12 +185,13 @@ def firewall_up(cfg):
     # Only IPv4 is exposed by uvicorn. This chain is attached ONLY for our TCP
     # port and never flushes a shared chain or touches UDP/NAT.
     port = str(cfg["port"])
+    sources = access.normalize(cfg["website_ips"])
     cmd = ["iptables", "-w", "5"]
     exists = subprocess.run(cmd + ["-S", FIREWALL], capture_output=True).returncode == 0
     if not exists:
         run(cmd + ["-N", FIREWALL])
         try:
-            for ip in cfg["website_ips"]:
+            for ip in sources:
                 run(cmd + ["-A", FIREWALL, "-s", ip, "-j", "ACCEPT"])
             run(cmd + ["-A", FIREWALL, "-j", "DROP"])
         except Exception:
@@ -186,7 +201,7 @@ def firewall_up(cfg):
     else:
         # Do not take ownership of an unrelated chain with the same name.
         expected = [f"-N {FIREWALL}"] + [
-            f"-A {FIREWALL} -s {ip}/32 -j ACCEPT" for ip in cfg["website_ips"]
+            f"-A {FIREWALL} -s {ip} -j ACCEPT" for ip in sources
         ] + [f"-A {FIREWALL} -j DROP"]
         actual = run(cmd + ["-S", FIREWALL]).stdout.strip().splitlines()
         if actual != expected:
@@ -322,11 +337,9 @@ def install():
         run(["systemctl", "enable", "--now", "vpn-node-api.service"], timeout=25)
         import time
         for _ in range(20):
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1):
-                    break
-            except OSError:
-                time.sleep(0.5)
+            if api_ready(port):
+                break
+            time.sleep(0.5)
         else:
             raise ValueError("API did not open its port; inspect journalctl -u vpn-node-api")
         status()
@@ -343,6 +356,17 @@ def install():
         if CONFIG.exists():
             firewall_down(cfg)
         raise
+
+
+def api_ready(port):
+    # A connection from loopback may be intentionally denied by the whitelist.
+    # Verify that the API's own process owns its listener instead.
+    pid = run(["systemctl", "show", "--property=MainPID", "--value",
+               "vpn-node-api.service"], timeout=3).stdout.strip()
+    if not pid.isdigit() or pid == "0":
+        return False
+    listeners = run(["ss", "-H", "-ltnp", f"sport = :{port}"], timeout=3).stdout
+    return bool(re.search(rf"\bpid={pid},", listeners))
 
 
 def status():
@@ -362,19 +386,119 @@ def status():
     print("Secret hidden; use rotate if you need a new credential.")
 
 
+def whitelist(operation=None, source=None):
+    def listing():
+        cfg = config()
+        print(f"API TCP port {cfg['port']} — allowed sources:")
+        for entry in access.normalize(cfg["website_ips"]):
+            print(" ", entry)
+        print("Ranges may include other tenants. Signed authentication remains required.")
+
+    def edit(action, value):
+        with account_lock(access.LOCK):
+            values, changed = access.change(CONFIG, action, value)
+        print("Whitelist updated." if changed else "Already allowed; nothing changed.")
+        print("Allowed sources:", ", ".join(values))
+        print("No services restarted. Rules persist across API starts and reboot.")
+
+    if operation == "list":
+        listing()
+    elif operation in ("add", "remove"):
+        if not source:
+            raise ValueError("Provide an IPv4 address or CIDR, for example 160.79.106.0/24")
+        edit(operation, source)
+    elif operation is None:
+        while True:
+            listing()
+            print("  1  Add IP / range\n  2  Remove IP / range\n  0  Back")
+            answer = input("Select: ").strip()
+            if answer in ("", "0"):
+                return
+            if answer not in ("1", "2"):
+                continue
+            value = input("IPv4 address or CIDR: ").strip()
+            canonical = str(access.network(value))
+            action = "add" if answer == "1" else "remove"
+            if input(f"{action.title()} {canonical}? type YES: ") == "YES":
+                edit(action, value)
+
+
+def update(menu_path=Path("/usr/local/bin/menu")):
+    """Update API code/menu only; preserve config, credentials, dependencies and accounts."""
+    if not CONFIG.is_file() or not UNIT.is_file() or not HOME.is_dir():
+        raise ValueError("No existing API installation; use install instead")
+    source = Path(__file__).parent.resolve()
+    destination = HOME / "vpn_node_api"
+    if source == destination.resolve():
+        raise ValueError("Run the downloaded API-only installer with --update-api")
+    names = ("__init__.py", "__main__.py", "common.py", "engine.py", "native.py",
+             "links.py", "server.py", "control.py", "access.py")
+    contents = {name: (source / name).read_text() for name in names}
+    for name, content in contents.items():
+        compile(content, name, "exec")
+    access.normalize(config()["website_ips"])
+    old_menu = menu_path.read_text()
+    new_menu = coordinated_menu(old_menu)
+    run(["bash", "-n"], input=new_menu)
+    before = {name: (destination / name).read_bytes() if (destination / name).exists() else None
+              for name in names}
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "vpn-node-api.service"],
+                            capture_output=True, timeout=5).returncode == 0
+    # Save recovery copies without credentials, even if power is lost mid-update.
+    backup = CONFIG.parent / ("code-backup-" + secrets.token_hex(4))
+    backup.mkdir(mode=0o700)
+    for name, content in before.items():
+        if content is not None:
+            atomic(backup / name, content)
+    atomic(backup / "menu", old_menu, 0o700)
+    stage("Updating the web API only; VPN services stay running")
+    if active:
+        run(["systemctl", "stop", "vpn-node-api.service"], timeout=35)
+    try:
+        for name, content in contents.items():
+            atomic(destination / name, content)
+        atomic(menu_path, new_menu, 0o755)
+    except Exception:
+        for name, content in before.items():
+            if content is None:
+                (destination / name).unlink(missing_ok=True)
+            else:
+                atomic(destination / name, content)
+        atomic(menu_path, old_menu, 0o755)
+        if active:
+            run(["systemctl", "start", "--no-block", "vpn-node-api.service"])
+        raise
+    print("API files updated. Account data, secrets and VPN configurations preserved.")
+    print("Run: vpn-node-api status")
+    print("Close and reopen menu to see option 17 → 5 (Allowed IPs / whitelist).")
+    return active
+
+
 def main():
     os.umask(0o077)
     os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "status", "rotate", "firewall-up",
-                                          "disable", "pending"))
+                                          "disable", "pending", "whitelist", "update"))
+    parser.add_argument("operation", nargs="?", choices=("list", "add", "remove"))
+    parser.add_argument("source", nargs="?")
     args = parser.parse_args()
+    if args.action != "whitelist" and (args.operation or args.source):
+        parser.error("Extra arguments are only supported for whitelist")
     if os.geteuid() != 0:
         raise SystemExit("Run as root")
     try:
         if args.action == "install":
             with account_lock("/run/lock/vpn-node-api-install.lock"):
                 install()
+        elif args.action == "update":
+            with account_lock("/run/lock/vpn-node-api-install.lock"), account_lock(access.LOCK):
+                active = update()
+            if active:
+                run(["systemctl", "start", "vpn-node-api.service"], timeout=25)
+            status()
+        elif args.action == "whitelist":
+            whitelist(args.operation, args.source)
         elif args.action == "status":
             status()
         elif args.action == "pending":
@@ -385,20 +509,24 @@ def main():
                     print("Pending:", row["id"], row["operation"])
             print("Do not replay blindly; reconcile the native account before clearing pending state.")
         elif args.action == "rotate":
-            cfg = config()
             if input("Invalidate website credentials and rotate the API secret? type YES: ") != "YES":
                 return
-            cfg.update(key_id="node-" + secrets.token_hex(4), secret=secrets.token_hex(32))
-            write_json(CONFIG, cfg)
+            with account_lock(access.LOCK):
+                cfg = config()
+                cfg.update(key_id="node-" + secrets.token_hex(4), secret=secrets.token_hex(32))
+                write_json(CONFIG, cfg)
             # This restarts ONLY the web API. Native authentication is independent.
             run(["systemctl", "restart", "vpn-node-api.service"], timeout=25)
             print("Key ID:", cfg["key_id"])
             print("New API secret (shown once):", cfg["secret"])
         elif args.action == "firewall-up":
-            firewall_up(config())
+            with account_lock(access.LOCK):
+                access.recover(CONFIG)
+                firewall_up(config())
         elif args.action == "disable":
             run(["systemctl", "disable", "--now", "vpn-node-api.service"], timeout=25)
-            firewall_down(config())
+            with account_lock(access.LOCK):
+                firewall_down(config())
             print("API disabled. All VPN protocols and account data retained.")
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         # Subprocess exceptions can contain command arguments: never print them.

@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from .common import Fault
+from .access import normalize, permits
 
 MAX_BODY = 65536
 LOG = logging.getLogger("vpn-node-api")
@@ -45,10 +46,11 @@ def authenticate(headers, method, target, body, config, store, now=None):
     return trace
 
 
-def app_for(config, engine):
+def app_for(config, engine, access_loader=None):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None,
                   redirect_slashes=False)
-    allowed = {ipaddress.ip_address(value) for value in config["website_ips"]}
+    normalize(config["website_ips"])
+    load_access = access_loader or (lambda: config["website_ips"])
 
     @app.middleware("http")
     async def gateway(request: Request, call_next):
@@ -59,7 +61,11 @@ def app_for(config, engine):
                 peer = ipaddress.ip_address(request.client.host)
             except (ValueError, AttributeError):
                 raise Fault("UNAUTHORIZED", "Source address not allowed", 401)
-            if peer not in allowed:
+            try:
+                permitted = permits(str(peer), load_access())
+            except (ValueError, OSError, KeyError):
+                permitted = False
+            if not permitted:
                 raise Fault("UNAUTHORIZED", "Source address not allowed", 401)
             protected = {"x-node-key-id", "x-node-timestamp", "x-node-nonce",
                          "x-node-signature", "x-request-id", "idempotency-key"}
