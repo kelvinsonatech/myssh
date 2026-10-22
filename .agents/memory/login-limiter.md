@@ -9,3 +9,5 @@ description: Rules for the optional SSH/SSL/SlowDNS multi-login limiter that liv
 - Policy: close the OLDEST sessions after a grace period; repeated strikes lock the account; delayed deletion. Website (API) accounts are expired with chage, not deleted with userdel, so the API record stays valid.
 - **Why:** the user repeatedly said "don't break or touch the protocols". Reconnect overlap must never punish real users.
 - **How to apply:** recommend watch-only mode first. The website is not told about locks or deletions; mention this if they ask.
+- API integration (user chose "show the ban in the API", not webhooks): API reads the limiter state + shadow "!" read-only and reports status "suspended" + suspension block; renew of a suspended SSH account is refused with ACCOUNT_SUSPENDED. The limiter itself never talks to the API.
+- API code changes reach the VPS only via `install.sh --update-api` (menu Update script is menu-only); always refresh install.sh manifest hashes and the pinned install.sh SHA in ssh-ssl-setup.sh.
