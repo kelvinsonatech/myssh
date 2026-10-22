@@ -7,15 +7,49 @@ from . import VERSION
 from .common import Fault, SSH, XRAY, Store, account_lock, days, invalid, stamp, utcnow, uuid_value, validate_create
 from .native import Uncertain
 
+LIMITER_STATE = "/var/lib/vpn-login-limiter/state.json"
+LIMITER_CONFIG = "/etc/vpn-login-limiter/config.json"
+
 
 class Engine:
     def __init__(self, config, native, store, lock="/run/lock/vpn-node-accounts.lock"):
         self.config, self.native, self.store, self.lock = config, native, store, lock
 
-    def public(self, account):
+    def suspensions(self):
+        """SSH accounts the multi-login limiter has locked (read-only view)."""
+        try:
+            locked = json.loads(self.native.text(LIMITER_STATE) or "{}").get("locked")
+            limiter = json.loads(self.native.text(LIMITER_CONFIG) or "{}")
+        except (ValueError, OSError, AttributeError):
+            return {}
+        if not isinstance(locked, dict) or not isinstance(limiter, dict):
+            return {}
+        delay = limiter.get("delete_after", 0)
+        deleting = limiter.get("mode") == "enforce" and isinstance(delay, int) and delay > 0
+        result = {}
+        for user, info in locked.items():
+            if not isinstance(info, dict) or not isinstance(info.get("at"), (int, float)):
+                continue
+            if not self.native.password_locked(user):
+                continue                     # unlocked by an administrator
+            since = dt.datetime.fromtimestamp(info["at"], dt.timezone.utc)
+            removed = bool(info.get("deleted"))
+            result[user] = {"reason": "multi_login", "suspended_at": stamp(since),
+                            "removed": removed,
+                            "removal_at": stamp(since + dt.timedelta(minutes=delay))
+                            if deleting and not removed else None}
+        return result
+
+    def public(self, account, suspended=None):
         result = copy.deepcopy(account)
         if result["expires_at"] <= stamp():
             result["status"] = "expired"
+        if result["protocol"] in SSH:
+            if suspended is None:
+                suspended = self.suspensions()
+            if result["username"] in suspended:
+                result["status"] = "suspended"
+                result["suspension"] = suspended[result["username"]]
         return result
 
     def info(self):
@@ -28,7 +62,7 @@ class Engine:
                 "country": self.config.get("country", ""), "server_time": stamp(), "protocols": protocols,
                 "capabilities": {"idempotency": True, "lookup_by_request_id": True, "renew": True,
                                  "list_accounts": True, "restart_agent": False,
-                                 "expiry_managed_by_node": False}}
+                                 "expiry_managed_by_node": False, "suspension_status": True}}
 
     def lookup(self, value, by_request=False):
         try:
@@ -56,13 +90,14 @@ class Engine:
         protocol = query.get("protocol")
         if protocol and protocol not in (*SSH, *XRAY, "hysteria", "hysteria2", "zivpn"):
             invalid("Unknown protocol")
+        suspended = self.suspensions()
         with self.store.connect() as db:
             rows = db.execute("SELECT document FROM accounts WHERE id>? AND deleted=0 ORDER BY id", (cursor,))
             accounts = []
             for row in rows:
                 account = json.loads(row[0])
                 if not protocol or account["protocol"] == protocol:
-                    accounts.append(self.public(account))
+                    accounts.append(self.public(account, suspended))
                 if len(accounts) > int(limit):
                     break
         more = len(accounts) > int(limit)
@@ -116,6 +151,9 @@ class Engine:
                 else:
                     account = self.store.account(account_id)
                     if operation == "renew":
+                        if account["protocol"] in SSH and account["username"] in self.suspensions():
+                            raise Fault("ACCOUNT_SUSPENDED", "Account is locked for multi-login abuse; "
+                                        "unlock it in the server menu before renewing", 409)
                         end = dt.datetime.fromisoformat(account["expires_at"].replace("Z", "+00:00"))
                         end = max(end, utcnow()) + dt.timedelta(days=body["duration_days"])
                         account["expires_at"], account["status"] = stamp(end), "active"

@@ -166,6 +166,71 @@ class Contract(unittest.TestCase):
                     self.assertEqual(calls[-1], ["chage", "-E", "2100-01-01", body["username"]])
                 self.assertEqual(self.account_file.read_text(), self.original)
 
+    def test_multi_login_suspension_is_reported_and_blocks_renewal(self):
+        root = self.native.root
+        body = {**self.body(), "protocol": "ssh", "username": "sharer"}
+        calls = []
+        def command(argv, data=None, **kwargs):
+            self.assertIn(argv[0], ("useradd", "chpasswd", "chage"))
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="")
+        with patch.object(self.native, "installed", return_value=True), \
+             patch.object(self.native, "running", return_value=True), \
+             patch.object(self.native, "connection", return_value={"password": "test-password"}), \
+             patch("vpn_node_api.native.pwd.getpwnam", side_effect=KeyError), \
+             patch.object(self.native, "run", side_effect=command):
+            created = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+        self.assertEqual(created.status_code, 201, created.text)
+        identity = created.json()["data"]["account"]["account_id"]
+        owner = SimpleNamespace(pw_uid=1500, pw_gecos="vpn-node=" + identity)
+
+        def get():
+            with patch("vpn_node_api.native.pwd.getpwnam", return_value=owner):
+                one = self.request("GET", f"/api/v1/accounts/{identity}").json()["data"]["account"]
+            listed = self.request("GET", "/api/v1/accounts").json()["data"]["accounts"]
+            self.assertEqual([a["status"] for a in listed if a["account_id"] == identity], [one["status"]])
+            return one
+
+        def renew():
+            payload = {"request_id": str(uuid.uuid4()), "duration_days": 2}
+            with patch.object(self.native, "run", side_effect=command), \
+                 patch("vpn_node_api.native.pwd.getpwnam", return_value=owner):
+                return self.request("POST", f"/api/v1/accounts/{identity}/renew", payload, payload["request_id"])
+
+        self.assertEqual(get()["status"], "active")
+        self.assertNotIn("suspension", get())
+        # The limiter locks the account (state + locked password).
+        (root / "etc/vpn-login-limiter").mkdir(parents=True)
+        (root / "etc/vpn-login-limiter/config.json").write_text(
+            json.dumps({"mode": "enforce", "delete_after": 60}))
+        (root / "var/lib/vpn-login-limiter").mkdir(parents=True)
+        state = root / "var/lib/vpn-login-limiter/state.json"
+        state.write_text(json.dumps({"locked": {"sharer": {"at": 4102444800, "pre_locked": False, "api": True}}}))
+        (root / "etc/shadow").write_text("sharer:!$6$hash:1::::::\n")
+        account = get()
+        self.assertEqual(account["status"], "suspended")
+        self.assertEqual(account["suspension"], {"reason": "multi_login", "suspended_at": "2100-01-01T00:00:00Z",
+                                                 "removed": False, "removal_at": "2100-01-01T01:00:00Z"})
+        before = len(calls)
+        refused = renew()
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.json()["error"]["code"], "ACCOUNT_SUSPENDED")
+        self.assertEqual(len(calls), before)                 # nothing touched on the server
+        # Lock-only mode: no removal time. Removed accounts say so.
+        (root / "etc/vpn-login-limiter/config.json").write_text(json.dumps({"mode": "enforce", "delete_after": 0}))
+        self.assertIsNone(get()["suspension"]["removal_at"])
+        state.write_text(json.dumps({"locked": {"sharer": {"at": 4102444800, "deleted": 4102448400}}}))
+        self.assertTrue(get()["suspension"]["removed"])
+        # Unlocked by the administrator → active again and renewable.
+        (root / "etc/shadow").write_text("sharer:$6$hash:1::::::\n")
+        self.assertEqual(get()["status"], "active")
+        self.assertEqual(renew().status_code, 200)
+        # Unreadable limiter files never break the API.
+        (root / "etc/shadow").write_text("sharer:!$6$hash:1::::::\n")
+        state.write_text("{broken")
+        self.assertEqual(get()["status"], "active")
+        self.assertTrue(self.request("GET", "/api/v1/info").json()["data"]["capabilities"]["suspension_status"])
+
     def test_linux_safety_date_midnight_and_leap_year(self):
         native = Native(self.config)
         for exact, safety in (("2096-02-28T00:00:00Z", "2096-02-29"),
