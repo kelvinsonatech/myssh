@@ -48,7 +48,8 @@ class Engine:
             if suspended is None:
                 suspended = self.suspensions()
             if result["username"] in suspended:
-                result["status"] = "suspended"
+                result["status"] = "disabled"
+                result["disabled_reason"] = "multi_login"
                 result["suspension"] = suspended[result["username"]]
         return result
 
