@@ -4484,7 +4484,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "976c0ceb8e1242a17dfc6a861523715eee7c1a056b92783ef908e6e4783ca36b" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "73e0d2e467b1fb1052a9d5ede5567f4ec3504811981ea5eca868f722d8388e92" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"
@@ -4938,7 +4938,14 @@ class Limiter:
             except Busy:
                 pass
         for user, items in live.items():
-            if user in st["locked"] or user in st["pending"]:
+            if user in st["locked"]:
+                # A login that slipped in around the lock (or a key login) is closed too.
+                if enforce and not st["locked"][user].get("deleted") and self.password_locked(user):
+                    closed = sum(self.close(s, user, accounts) for s in items)
+                    if closed:
+                        self.log(f"closed {closed} login(s) on locked account {user}")
+                continue
+            if user in st["pending"]:
                 continue
             limit = cfg["overrides"].get(user, cfg["limit"])
             if len(items) <= limit:
@@ -5293,6 +5300,9 @@ limiter_menu() {
                    && ok "Limit set to ${W}$value${NC}. Applies within seconds; nothing restarted." \
                    || err "Enter a number from 1 to 50."; pause;;
             3) read -rp "$(echo -e "  ${C}Username${NC}: ")" user
+               if ! awk -F: -v u="$user" '$1==u && $3>=1000 && ($7=="/bin/false"||$7=="/usr/sbin/nologin"){f=1} END{exit !f}' /etc/passwd; then
+                   err "$user is not an SSH account."; pause; continue
+               fi
                value=$(lim_ask_number "Connections for $user (0 = use default)" 0 0 50) \
                    || { err "Enter a number from 0 to 50."; pause; continue; }
                if [ "$value" = 0 ]; then

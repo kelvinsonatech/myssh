@@ -248,6 +248,13 @@ class Native:
         cfg = account["config"]
         return cfg.get("password", cfg.get("uuid", cfg.get("auth")))
 
+    def password_locked(self, user):
+        for line in self.text("/etc/shadow").splitlines():
+            fields = line.split(":")
+            if fields[0] == user and len(fields) > 1:
+                return fields[1].startswith("!")
+        return False
+
     def owns(self, account):
         protocol, user, secret = account["protocol"], account["username"], self.secret(account)
         if protocol in SSH:
