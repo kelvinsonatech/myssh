@@ -199,6 +199,7 @@ class Contract(unittest.TestCase):
 
         self.assertEqual(get()["status"], "active")
         self.assertNotIn("suspension", get())
+        self.assertNotIn("disabled_reason", get())
         # The limiter locks the account (state + locked password).
         (root / "etc/vpn-login-limiter").mkdir(parents=True)
         (root / "etc/vpn-login-limiter/config.json").write_text(
@@ -208,7 +209,8 @@ class Contract(unittest.TestCase):
         state.write_text(json.dumps({"locked": {"sharer": {"at": 4102444800, "pre_locked": False, "api": True}}}))
         (root / "etc/shadow").write_text("sharer:!$6$hash:1::::::\n")
         account = get()
-        self.assertEqual(account["status"], "suspended")
+        self.assertEqual(account["status"], "disabled")
+        self.assertEqual(account["disabled_reason"], "multi_login")
         self.assertEqual(account["suspension"], {"reason": "multi_login", "suspended_at": "2100-01-01T00:00:00Z",
                                                  "removed": False, "removal_at": "2100-01-01T01:00:00Z"})
         before = len(calls)
@@ -224,6 +226,7 @@ class Contract(unittest.TestCase):
         # Unlocked by the administrator → active again and renewable.
         (root / "etc/shadow").write_text("sharer:$6$hash:1::::::\n")
         self.assertEqual(get()["status"], "active")
+        self.assertNotIn("disabled_reason", get())
         self.assertEqual(renew().status_code, 200)
         # Unreadable limiter files never break the API.
         (root / "etc/shadow").write_text("sharer:!$6$hash:1::::::\n")
