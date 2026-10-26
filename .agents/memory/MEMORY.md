@@ -9,3 +9,4 @@
 - [ZIVPN isolation](zivpn-isolation.md) — actual upstream binary; user confirmed working; preserve protocol isolation and concise details.
 - [Node API nondisruption](node-api-nondisruption.md) — no shared-tunnel restarts for website account creation; live updates and initial migration must be verified separately.
 - [Multi-login limiter](login-limiter.md) — API menu only (17→7); engine embedded verbatim; API reports bans as status "disabled" + disabled_reason; never restarts VPN services.
+- [V2Ray website sub accounts](v2ray-sub-accounts.md) — API shares a menu-chosen main account key; never touches/restarts Xray; subs not individually revocable (user accepted).
