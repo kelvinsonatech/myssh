@@ -57,3 +57,4 @@ The user confirmed their existing native ZIVPN setup works and wants it preserve
 enabling automatic ZIVPN provisioning. SSH and the existing Hysteria 2 command
 auth can read new credentials without shared restarts; Xray's runtime HandlerService
 requires addressable, tagged tunnel inbounds, not merely its API listener tag.
+- Remote installer must `cd "$work"` before `python3 -m`: python -m imports from the cwd first, so running it from /opt/vpn-node-api silently loaded the old installed code.
