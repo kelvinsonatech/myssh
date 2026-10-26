@@ -107,6 +107,24 @@ class Native:
             result.append(fields)
         return result
 
+    def zivpn_main(self):
+        """Read the opted-in shared password; never modify the tunnel."""
+        try:
+            selected = self.load("/etc/zivpn/api-main.json")
+            auth = self.load(FILES["zivpn"][0]).get("auth", {})
+            password = selected.get("password")
+            if (auth.get("mode") == "passwords" and isinstance(password, str)
+                    and password and password in auth.get("config", [])):
+                return password
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        return None
+
+    def zivpn_blocker(self):
+        if self.zivpn_main() is None:
+            return "Choose an existing password in menu → ZIVPN → Website sub accounts"
+        return None
+
     def xray_main(self, protocol):
         """The menu-chosen account whose key the website's sub accounts share."""
         remark = None
@@ -176,16 +194,17 @@ class Native:
             elif "port" in config:
                 ports = {"udp": [config["port"]]}
             blocker = ("Live updates have not been verified for this installation"
-                       if protocol in ("hysteria", "zivpn") else
+                       if protocol == "hysteria" else
+                       self.zivpn_blocker() if protocol == "zivpn" else
                        self.xray_blocker(protocol) if protocol in XRAY else None)
             result.append({"id": protocol, "installed": True, "running": self.running(protocol),
                            "ports": ports, "transports": sorted({c["network"] for c in config.get("connections", [])}),
                            "current_accounts": self.count(protocol), "max_accounts": None,
                            "metadata": {"account_scope": "shared_linux_user" if protocol in SSH else
-                                                         "shared_main_account" if protocol in XRAY else "native",
+                                                         "shared_main_account" if protocol in (*XRAY, "zivpn") else "native",
                                         "changes_restart_service": False,
                                         "api_provisioning": protocol in (*SSH, "hysteria2") or (
-                                            protocol in XRAY and blocker is None),
+                                            protocol in (*XRAY, "zivpn") and blocker is None),
                                         "provisioning_blocker": blocker}})
         return result
 
@@ -248,7 +267,7 @@ class Native:
 
     def prepare(self, body):
         protocol, user = body["protocol"], body["username"]
-        if protocol in ("hysteria", "zivpn"):
+        if protocol == "hysteria":
             raise Fault("PROTOCOL_UNAVAILABLE",
                         "No verified no-restart adapter for this installation", 409)
         if not self.installed(protocol) or not self.running(protocol):
@@ -271,9 +290,13 @@ class Native:
             if blocker:
                 raise Fault("PROTOCOL_UNAVAILABLE", blocker, 409)
             secret = self.xray_main(protocol)[2]      # sub account: shared key, own name
+        elif protocol == "zivpn":
+            secret = self.zivpn_main()
+            if secret is None:
+                raise Fault("PROTOCOL_UNAVAILABLE", self.zivpn_blocker(), 409)
         else:
             secret = body.get("password") or secrets.token_hex(12)
-        if protocol in ("hysteria", "zivpn"):
+        if protocol == "hysteria":
             cfg = self.load(FILES[protocol][-1])
             if cfg.get("auth", {}).get("mode") != "passwords":
                 raise Fault("PROTOCOL_UNAVAILABLE", "Native password authentication is not configured", 409)
@@ -333,8 +356,17 @@ class Native:
 
     def perform(self, operation, account):
         protocol, user, secret = account["protocol"], account["username"], self.secret(account)
-        if protocol in ("hysteria", "zivpn"):
+        if protocol == "hysteria":
             raise Fault("PROTOCOL_UNAVAILABLE", "Verified no-restart provisioning is not configured", 409)
+        if protocol == "zivpn":
+            # Delete removes only the API record, even if the main password is gone.
+            if operation == "delete":
+                return
+            if operation == "create" and secret != self.zivpn_main():
+                raise Fault("PROTOCOL_UNAVAILABLE", "Choose a valid ZIVPN main password first", 409)
+            if not self.owns(account):
+                raise Fault("ACCOUNT_NOT_FOUND", "The shared ZIVPN password was removed", 404)
+            return
         if operation != "create" and not self.owns(account):
             raise Fault("ACCOUNT_NOT_FOUND", "Account was removed or changed outside this API", 404)
         if protocol in XRAY:

@@ -328,6 +328,58 @@ class Contract(unittest.TestCase):
         self.assertEqual((accounts.read_bytes(), config.read_bytes()), before)   # Xray untouched
         self.assertEqual(self.account_file.read_text(), self.original)
 
+    def test_zivpn_shared_password_lifecycle_without_tunnel_changes(self):
+        root = self.native.root / "etc/zivpn"
+        root.mkdir(parents=True)
+        config = root / "config.json"
+        original = json.dumps({"auth": {"mode": "passwords", "config": ["shared-pass", "other-pass"]},
+                               "obfs": "zivpn"})
+        config.write_text(original)
+        selection = root / "api-main.json"
+
+        def create(name):
+            body = {**self.body(), "protocol": "zivpn", "username": name}
+            response = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+            return response, body
+
+        with patch.object(self.native, "installed", return_value=True), \
+             patch.object(self.native, "running", return_value=True):
+            self.assertEqual(create("alice")[0].status_code, 409)
+            selection.write_text('{"password":"missing"}')
+            self.assertEqual(create("alice")[0].status_code, 409)
+            selection.write_text('{"password":"shared-pass"}')
+            self.assertIsNone(self.native.zivpn_blocker())
+            first, body = create("alice")
+            self.assertEqual(first.status_code, 201, first.text)
+            account = first.json()["data"]["account"]
+            self.assertEqual(account["config"]["password"], "shared-pass")
+            second, _ = create("betty")
+            self.assertEqual(second.status_code, 201, second.text)
+            self.assertEqual(second.json()["data"]["account"]["config"]["password"], "shared-pass")
+            replay = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+            self.assertTrue(replay.json()["data"]["replayed"])
+            self.assertEqual(create("alice")[0].status_code, 409)
+            path = "/api/v1/accounts/" + account["account_id"]
+            self.assertEqual(self.request("GET", path).status_code, 200)
+            listed = self.request("GET", "/api/v1/accounts?protocol=zivpn").json()["data"]["accounts"]
+            self.assertEqual(len(listed), 2)
+            # Disabling opt-in prevents new accounts but leaves existing ones renewable.
+            selection.unlink()
+            self.assertEqual(create("carol")[0].status_code, 409)
+            payload = {"request_id": str(uuid.uuid4()), "duration_days": 3}
+            self.assertEqual(self.request("POST", path + "/renew", payload, payload["request_id"]).status_code, 200)
+            self.assertEqual(self.request("DELETE", path, key=str(uuid.uuid4())).status_code, 200)
+            self.assertEqual(self.request("GET", path).status_code, 404)
+            self.assertEqual(config.read_text(), original)
+            self.assertEqual(self.account_file.read_text(), self.original)
+            # External password removal: lookup/renew refuse; deleting the record still works.
+            config.write_text('{"auth":{"mode":"passwords","config":["other-pass"]}}')
+            path = "/api/v1/accounts/" + second.json()["data"]["account"]["account_id"]
+            self.assertEqual(self.request("GET", path).status_code, 404)
+            payload["request_id"] = str(uuid.uuid4())
+            self.assertEqual(self.request("POST", path + "/renew", payload, payload["request_id"]).status_code, 404)
+            self.assertEqual(self.request("DELETE", path, key=str(uuid.uuid4())).status_code, 200)
+
     def test_source_acl_and_body_limit(self):
         with TestClient(app_for(self.config, self.engine), client=("192.0.2.25", 1234)) as client:
             response = client.get("/api/v1/info", headers=self.headers("GET", "/api/v1/info"))

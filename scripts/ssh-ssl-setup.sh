@@ -4516,6 +4516,81 @@ ZILIST
     ok "ZIVPN passwords updated."; zi_details; pause
 )
 
+zi_sub() {
+    while :; do
+        section "ZIVPN WEBSITE SUB ACCOUNTS" "$TEAL"
+        note "Shared password: expiry/deletion on the website cannot disconnect one customer."
+        echo "  1  Choose existing main password for website"
+        echo "  2  Make a named sub-account connection here"
+        echo "  3  Stop new website sub accounts (existing users stay connected)"
+        echo "  0  Back"
+        local choice
+        read -rp "  Select: " choice
+        case "$choice" in
+            0|"") return;;
+            1|2|3) ;;
+            *) err "Invalid option."; continue;;
+        esac
+        # Separate opt-in file only: no tunnel config writes or service commands.
+        python3 - "$ZI_DIR" "$choice" <<'ZISUBPY'
+import json, os, sys, tempfile
+from pathlib import Path
+root, action = Path(sys.argv[1]), sys.argv[2]
+selected = root / "api-main.json"
+try:
+    with open("/dev/tty") as tty:
+        def ask(prompt):
+            print(prompt, end="", flush=True)
+            value = tty.readline()
+            if not value:
+                raise ValueError("Input cancelled")
+            return value.strip()
+        if action == "3":
+            selected.unlink(missing_ok=True)
+            print("New website sub accounts disabled. Existing passwords remain valid.")
+        else:
+            cfg = json.loads((root / "config.json").read_text())
+            auth = cfg.get("auth", {})
+            passwords = auth.get("config", [])
+            if auth.get("mode") != "passwords" or not passwords:
+                raise ValueError("Install ZIVPN and create a working password first.")
+            if action == "1":
+                for i, password in enumerate(passwords, 1):
+                    print(f"  {i}) {password}")
+                number = int(ask("  Main password number: "))
+                if not 1 <= number <= len(passwords):
+                    raise ValueError("Invalid password number")
+                password = passwords[number - 1]
+                fd, name = tempfile.mkstemp(prefix=".api-main-", dir=root)
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump({"password": password}, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(name, selected)
+                finally:
+                    if os.path.exists(name):
+                        os.unlink(name)
+                print("Website sub accounts enabled. ZIVPN was not changed or restarted.")
+            else:
+                password = json.loads(selected.read_text()).get("password")
+                if password not in passwords:
+                    raise ValueError("Choose a valid main password using option 1 first.")
+                name = ask("  Sub-account name: ")
+                if not name or len(name) > 32 or not all(c.isascii() and (c.isalnum() or c in "_.-") for c in name):
+                    raise ValueError("Use 1–32 letters, numbers, underscores, dots or hyphens.")
+                print(f"\n  Sub account: {name}\n  Shared password: {password}")
+                print("  UDP ports: 6000–19999")
+                print("  Use the server address shown in ZIVPN connection details.")
+                print("  Connection label only; no website record is created here.")
+except (OSError, ValueError, TypeError, AttributeError) as e:
+    print(f"Cannot complete request: {e}", file=sys.stderr)
+    sys.exit(1)
+ZISUBPY
+        pause
+    done
+}
+
 zi_menu() (
     export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
     local choice answer
@@ -4534,6 +4609,7 @@ zi_menu() (
         menu_item "3" "≡" "Connection details / passwords" "$TEAL"
         menu_item "4" "−" "Delete tunnel password" "$ORANGE"
         menu_item "5" "○" "Deactivate ZIVPN only" "$Y"
+        menu_item "6" " " "Website sub accounts" "$SKY"
         menu_item "0" "↩" "Back" "$GR"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4541,6 +4617,7 @@ zi_menu() (
             2) zi_passwords add;;
             3) zi_details; pause;;
             4) zi_passwords delete;;
+            6) zi_sub;;
             5)
                 zi_owned || { err "No panel-managed ZIVPN installation."; pause; continue; }
                 read -rp "  Disconnect ZIVPN users and disable on reboot? type YES: " answer
@@ -4580,7 +4657,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "be618117fd593b0dacca5092005978bbc8f9e4cde53d0ec43fdb3e3e0a75960c" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "29e1ea19aaf39240148e226b857e327419c4b82292dab00d14db57dde5965ddb" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"

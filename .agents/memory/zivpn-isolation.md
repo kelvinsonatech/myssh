@@ -32,6 +32,16 @@ or a publisher signature.
 Passwords are application credentials, not Linux accounts. Do not infer account
 expiry support from having a date field in a menu.
 
+Website sub accounts may share an explicitly selected existing ZIVPN password.
+Their usernames and expiry are bookkeeping only, not independently enforced
+tunnel credentials. Never mutate ZIVPN configuration or restart it for these.
+
+**Why:** the user explicitly accepted the same shared-credential tradeoff as
+V2Ray, including inability to revoke one customer's saved password.
+
+**How to apply:** preserve the existing API contract; disabling new sub accounts
+must leave existing passwords usable. Never claim deletion disconnects a user.
+
 **Why:** password reload/disconnect semantics must be established first. For now
 changes require an explicitly confirmed ZIVPN-only restart, with no auto-expiry
 claim and no restart of other services.
