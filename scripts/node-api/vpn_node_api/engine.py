@@ -143,7 +143,7 @@ class Engine:
                     count = db.execute("SELECT count(*) FROM accounts WHERE deleted=0").fetchone()[0]
                     if capacity and count >= capacity:
                         raise Fault("CAPACITY_REACHED", "API account capacity reached", 409)
-                    rows = db.execute("SELECT document FROM accounts WHERE deleted=0")
+                    rows = db.execute("SELECT document FROM accounts WHERE deleted=0").fetchall()
                     for row in rows:
                         other = json.loads(row[0])
                         if other["protocol"] == body["protocol"] and other["username"] == body["username"]:

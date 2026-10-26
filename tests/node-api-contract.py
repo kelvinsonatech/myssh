@@ -1,4 +1,5 @@
 """Isolated HTTP contract and native-file tests. No host users/services changed."""
+import base64
 import json
 import pathlib
 import sys
@@ -262,6 +263,70 @@ class Contract(unittest.TestCase):
         self.assertEqual(self.account_file.read_text(), self.original)
         with self.store.connect() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM requests").fetchone()[0], 0)
+
+    def test_v2ray_sub_accounts_share_main_key_and_never_touch_xray(self):
+        root = self.native.root
+        (root / "etc/xray").mkdir(parents=True)
+        (root / "usr/local/etc/xray").mkdir(parents=True)
+        accounts = root / "etc/xray/accounts.txt"
+        config = root / "usr/local/etc/xray/config.json"
+        main_id = "11111111-2222-4333-8444-555555555555"
+        accounts.write_text(f"vmess|boss|{main_id}|never|0\n"
+                            "vless|capped|22222222-2222-4333-8444-555555555555|never|1073741824\n")
+        config.write_text(json.dumps({"inbounds": [
+            {"port": 2083, "protocol": "vmess", "settings": {"clients": [{"id": main_id, "email": "boss"}]},
+             "streamSettings": {"network": "ws", "security": "tls", "wsSettings": {"path": "/vmess"}}},
+            {"port": 8080, "protocol": "vmess", "settings": {"clients": [{"id": main_id, "email": "boss"}]},
+             "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/vmess"}}}]}))
+        before = (accounts.read_bytes(), config.read_bytes())
+        main_file = root / "etc/xray/api-main.conf"
+
+        def create(name, protocol="vmess", days_=7):
+            body = {**self.body(), "protocol": protocol, "username": name, "duration_days": days_}
+            body.pop("password")
+            return self.request("POST", "/api/v1/accounts", body, body["request_id"])
+
+        installed = lambda protocol: protocol in ("hysteria2", "vmess", "vless", "trojan")
+        with patch.object(self.native, "installed", side_effect=installed):
+            refused = create("kofi")                                  # no main account chosen yet
+            self.assertEqual(refused.status_code, 409)
+            self.assertIn("Website sub accounts", refused.json()["error"]["message"])
+            main_file.write_text("vmess|boss\nvless|capped\n")
+            self.assertEqual(create("ama", "vless").status_code, 409)   # quota main refused
+            info = self.request("GET", "/api/v1/protocols").json()["data"]["protocols"]
+            vmess = next(p for p in info if p["id"] == "vmess")
+            self.assertTrue(vmess["metadata"]["api_provisioning"])
+            self.assertEqual(vmess["metadata"]["account_scope"], "shared_main_account")
+
+            first, second = create("kofi").json()["data"]["account"], create("yaw").json()["data"]["account"]
+            for account, name in ((first, "kofi"), (second, "yaw")):
+                self.assertEqual(account["config"]["uuid"], main_id)
+                self.assertEqual(account["config"]["remark"], name)
+                self.assertEqual({c["port"] for c in account["config"]["connections"]}, {2083, 8080})
+                link = json.loads(base64.b64decode(account["config"]["links"][0]["uri"][8:]))
+                self.assertEqual((link["id"], link["ps"].split("-")[0]), (main_id, name))
+            self.assertEqual(create("kofi").json()["error"]["code"], "USERNAME_TAKEN")
+            self.assertEqual(create("boss").json()["error"]["code"], "USERNAME_TAKEN")
+            path = f"/api/v1/accounts/{first['account_id']}"
+            self.assertEqual(self.request("GET", path).status_code, 200)
+            renew = {"request_id": str(uuid.uuid4()), "duration_days": 30}
+            self.assertEqual(self.request("POST", path + "/renew", renew, renew["request_id"]).status_code, 200)
+            listed = self.request("GET", "/api/v1/accounts?protocol=vmess").json()["data"]["accounts"]
+            self.assertEqual(sorted(a["username"] for a in listed), ["kofi", "yaw"])
+            # A main account that expires sooner caps how long sub accounts may last.
+            soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=10)).date().isoformat()
+            accounts.write_text(before[0].decode().replace("|never|0\n", f"|{soon}|0\n", 1))
+            self.assertEqual(create("esi", days_=30).status_code, 422)
+            self.assertEqual(create("esi", days_=3).status_code, 201)
+            accounts.write_bytes(before[0])
+            self.assertEqual(self.request("DELETE", path, None, str(uuid.uuid4())).status_code, 200)
+            self.assertEqual(self.request("GET", path).status_code, 404)
+            # Main account deleted from the menu → its sub accounts are reported gone.
+            accounts.write_text("vless|capped|22222222-2222-4333-8444-555555555555|never|1073741824\n")
+            self.assertEqual(self.request("GET", f"/api/v1/accounts/{second['account_id']}").status_code, 404)
+            accounts.write_bytes(before[0])
+        self.assertEqual((accounts.read_bytes(), config.read_bytes()), before)   # Xray untouched
+        self.assertEqual(self.account_file.read_text(), self.original)
 
     def test_source_acl_and_body_limit(self):
         with TestClient(app_for(self.config, self.engine), client=("192.0.2.25", 1234)) as client:

@@ -28,6 +28,8 @@ FILES = {"vmess": ["/etc/xray/accounts.txt", "/usr/local/etc/xray/config.json"],
          "hysteria2": ["/etc/hysteria2/accounts"],
          "zivpn": ["/etc/zivpn/config.json"]}
 FILES["vless"] = FILES["trojan"] = FILES["vmess"]
+# Menu → V2Ray → Website sub accounts writes "protocol|remark" lines here.
+XRAY_MAIN = "/etc/xray/api-main.conf"
 
 
 class Uncertain(Exception):
@@ -105,6 +107,46 @@ class Native:
             result.append(fields)
         return result
 
+    def xray_main(self, protocol):
+        """The menu-chosen account whose key the website's sub accounts share."""
+        remark = None
+        for line in self.text(XRAY_MAIN).splitlines():
+            fields = line.strip().split("|")
+            if len(fields) == 2 and fields[0] == protocol and fields[1]:
+                remark = fields[1]
+        if remark is None:
+            return None
+        return next((row for row in self.xrows() if row[0] == protocol and row[1] == remark), None)
+
+    def xray_blocker(self, protocol):
+        row = self.xray_main(protocol)
+        if row is None:
+            return "Choose a main account in menu → V2Ray → Website sub accounts"
+        if row[4] not in ("", "0"):
+            return "The main account has a data quota; choose one with unlimited data"
+        return None
+
+    def xray_check(self, account):
+        """Sub accounts change nothing in Xray; they only need a valid main account."""
+        protocol = account["protocol"]
+        blocker = self.xray_blocker(protocol)
+        if blocker:
+            raise Fault("PROTOCOL_UNAVAILABLE", blocker, 409)
+        main = self.xray_main(protocol)
+        if main[2] != self.secret(account):
+            raise Fault("ACCOUNT_NOT_FOUND", "The main account for this sub account was changed", 404)
+        if main[3] not in ("", "never"):
+            try:
+                day = dt.date.fromisoformat(main[3])
+            except ValueError:
+                raise Fault("PROTOCOL_UNAVAILABLE", "The main account has an unreadable expiry date", 409)
+            # xray-check removes the main account at local midnight of that date.
+            ends = dt.datetime.combine(day, dt.time()).astimezone(dt.timezone.utc)
+            wanted = dt.datetime.fromisoformat(account["expires_at"].replace("Z", "+00:00"))
+            if wanted > ends:
+                raise Fault("VALIDATION_FAILED", "duration_days goes past the V2Ray main account's expiry "
+                            f"({main[3]}); choose fewer days", 422)
+
     def password_rows(self, protocol):
         separator = "\t" if protocol == "hysteria2" else ":"
         return [line.split(separator, 2 if protocol == "hysteria2" else 1)
@@ -133,15 +175,18 @@ class Native:
                     ports.setdefault(connection["security"], []).append(connection["port"])
             elif "port" in config:
                 ports = {"udp": [config["port"]]}
+            blocker = ("Live updates have not been verified for this installation"
+                       if protocol in ("hysteria", "zivpn") else
+                       self.xray_blocker(protocol) if protocol in XRAY else None)
             result.append({"id": protocol, "installed": True, "running": self.running(protocol),
                            "ports": ports, "transports": sorted({c["network"] for c in config.get("connections", [])}),
                            "current_accounts": self.count(protocol), "max_accounts": None,
-                           "metadata": {"account_scope": "shared_linux_user" if protocol in SSH else "native",
+                           "metadata": {"account_scope": "shared_linux_user" if protocol in SSH else
+                                                         "shared_main_account" if protocol in XRAY else "native",
                                         "changes_restart_service": False,
-                                        "api_provisioning": protocol in (*SSH, "hysteria2"),
-                                        "provisioning_blocker": (
-                                            "Live updates have not been verified for this installation"
-                                            if protocol in (*XRAY, "hysteria", "zivpn") else None)}})
+                                        "api_provisioning": protocol in (*SSH, "hysteria2") or (
+                                            protocol in XRAY and blocker is None),
+                                        "provisioning_blocker": blocker}})
         return result
 
     def connection(self, protocol, user, secret):
@@ -203,7 +248,7 @@ class Native:
 
     def prepare(self, body):
         protocol, user = body["protocol"], body["username"]
-        if protocol in (*XRAY, "hysteria", "zivpn"):
+        if protocol in ("hysteria", "zivpn"):
             raise Fault("PROTOCOL_UNAVAILABLE",
                         "No verified no-restart adapter for this installation", 409)
         if not self.installed(protocol) or not self.running(protocol):
@@ -221,8 +266,13 @@ class Native:
         elif protocol != "zivpn":
             if any(row[0] == user for row in self.password_rows(protocol)):
                 raise Fault("USERNAME_TAKEN", "Username already exists", 409)
-        secret = (str(uuid.uuid4()) if protocol in ("vmess", "vless") else
-                  body.get("password") or secrets.token_hex(12))
+        if protocol in XRAY:
+            blocker = self.xray_blocker(protocol)
+            if blocker:
+                raise Fault("PROTOCOL_UNAVAILABLE", blocker, 409)
+            secret = self.xray_main(protocol)[2]      # sub account: shared key, own name
+        else:
+            secret = body.get("password") or secrets.token_hex(12)
         if protocol in ("hysteria", "zivpn"):
             cfg = self.load(FILES[protocol][-1])
             if cfg.get("auth", {}).get("mode") != "passwords":
@@ -264,7 +314,7 @@ class Native:
                 return False
             return entry.pw_uid >= 1000 and entry.pw_gecos == "vpn-node=" + account["account_id"]
         if protocol in XRAY:
-            return any(r[:3] == [protocol, user, secret] for r in self.xrows())
+            return any(r[0] == protocol and r[2] == secret for r in self.xrows())
         if protocol == "zivpn":
             return secret in self.load(FILES[protocol][0])["auth"]["config"]
         return any(r[:2] == [user, secret] for r in self.password_rows(protocol))
@@ -283,10 +333,15 @@ class Native:
 
     def perform(self, operation, account):
         protocol, user, secret = account["protocol"], account["username"], self.secret(account)
-        if protocol in (*XRAY, "hysteria", "zivpn"):
+        if protocol in ("hysteria", "zivpn"):
             raise Fault("PROTOCOL_UNAVAILABLE", "Verified no-restart provisioning is not configured", 409)
         if operation != "create" and not self.owns(account):
             raise Fault("ACCOUNT_NOT_FOUND", "Account was removed or changed outside this API", 404)
+        if protocol in XRAY:
+            # Never writes Xray files or restarts Xray: the record lives in the API only.
+            if operation != "delete":
+                self.xray_check(account)
+            return
         if protocol in SSH:
             self.ssh_operation(operation, account)
             return
@@ -295,9 +350,7 @@ class Native:
         snapshots = [(name, self.path(name).read_bytes(), self.path(name).stat())
                      for name in FILES[protocol]]
         try:
-            if protocol in XRAY:
-                self.xray_operation(operation, account)
-            elif protocol == "hysteria2":
+            if protocol == "hysteria2":
                 rows = self.password_rows(protocol)
                 rows = [r for r in rows if r[0] != user]
                 if operation != "delete":
@@ -335,28 +388,6 @@ class Native:
             except Exception:
                 raise Uncertain("Native rollback needs administrator recovery")
             raise
-
-    def xray_operation(self, operation, account):
-        protocol, user, secret = account["protocol"], account["username"], self.secret(account)
-        rows = [row for row in self.xrows() if row[1] != user]
-        if operation != "delete":
-            rows.append([protocol, user, secret, account["expires_at"][:10], "0"])
-        self.write("/etc/xray/accounts.txt", "".join("|".join(r) + "\n" for r in rows))
-        config = self.load("/usr/local/etc/xray/config.json")
-        # Preserve every listener, port, certificate, routing rule and transport.
-        # Empty inbounds remain, so deleting the last account cannot shift ports.
-        for inbound in config.get("inbounds", []):
-            if inbound.get("protocol") != protocol:
-                continue
-            clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-            clients[:] = [c for c in clients if c.get("email") != user]
-            if operation != "delete":
-                client = {"email": user, "password" if protocol == "trojan" else "id": secret}
-                if protocol == "vmess":
-                    client["alterId"] = 0
-                clients.append(client)
-        self.write("/usr/local/etc/xray/config.json", config)
-        self.run(["/usr/local/bin/xray", "run", "-test", "-config", "/usr/local/etc/xray/config.json"])
 
     def ssh_operation(self, operation, account):
         user, secret = account["username"], self.secret(account)
