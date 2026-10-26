@@ -14,6 +14,7 @@ command -v python3 >/dev/null || { echo "Python 3.9+ is required."; exit 1; }
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$here/vpn_node_api/control.py" ]]; then
     export PYTHONPATH="$here"
+    cd "$here"   # never import an installed copy from the caller's directory
     exec python3 -m vpn_node_api.control "$action"
 fi
 command -v curl >/dev/null || { echo "curl is required."; exit 1; }
@@ -39,4 +40,7 @@ ec435b7c6d7c77df6ec780b7d0d0cf3af96871ae7e50ef06e5216b86aeea8ad4 native.py
 0ba2c44261126d10f3febffb136b94f829a434d75c7382c9a3584a8e3db5af0b server.py
 API_MANIFEST
 export PYTHONPATH="$work"
+# python3 -m searches the current directory first; running from
+# /opt/vpn-node-api would otherwise load the old installed code.
+cd "$work"
 python3 -m vpn_node_api.control "$action"
