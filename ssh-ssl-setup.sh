@@ -2371,6 +2371,8 @@ VL_WS_TLS=2083; VL_WS_NONE=8080; VL_HTTP_NONE=2082; VL_HTTP_TLS=2087; VL_SPLIT_T
 TR_WS_TLS=2083; TR_WS_NONE=8080; TR_HTTP_NONE=2082; TR_HTTP_TLS=2087; TR_SPLIT_TLS=2096; TR_SPLIT_NONE=2095
 # Port-443 handover flag (when set, V2Ray owns 443 and SSL payload is off)
 XP443F=/etc/xray/port443
+# Website sub accounts: "protocol|remark" of the main account each protocol shares.
+XSUBF=/etc/xray/api-main.conf
 STCONF=/etc/stunnel/stunnel.conf
 STCERT=/etc/stunnel/stunnel.pem
 
@@ -2550,11 +2552,16 @@ mkuri() {
     fi
 }
 
-show_links() {  # remark
+show_links() {  # remark [sub-account name]
     local rk="$1"
     parse_acct "$(grep -m1 "|${rk}|" "$XACC" 2>/dev/null || grep -m1 "^${rk}|" "$XACC" 2>/dev/null)"
     banner
+    if [ -n "$2" ]; then
+        rk="$2"
+        echo -e "  ${GR}Sub acct${NC} ${W}${rk}${NC}  ${GR}of main${NC} ${W}${P_RK}${NC}    ${GR}Type${NC} ${P}${BOLD}$(echo "$P_PROTO" | tr a-z A-Z)${NC}"
+    else
     echo -e "  ${GR}Remark${NC}  ${W}${P_RK}${NC}    ${GR}Type${NC} ${P}${BOLD}$(echo "$P_PROTO" | tr a-z A-Z)${NC}"
+    fi
     echo -e "  ${GR}Secret${NC}  ${W}${P_SEC}${NC}"
     echo -e "  ${GR}Host${NC}    ${Y}${XHOST}${NC}"
     echo -e "  ${GR}Expires${NC} ${W}${P_EXP:-never}${NC}"
@@ -2706,12 +2713,99 @@ xray_delete() {
     section "DELETE XRAY ACCOUNT" "$R"
     read -rp "$(echo -e "  ${C}Remark to delete${NC} : ")" q
     if ! grep -q "|${q}|" "$XACC" 2>/dev/null && ! grep -q "^${q}|" "$XACC" 2>/dev/null; then err "Remark not found."; pause; return; fi
+    if grep -q "|${q}$" "$XSUBF" 2>/dev/null; then
+        warn "'${W}$q${NC}' is the main account for website sub accounts — they will ALL stop working."
+        read -rp "$(echo -e "  ${C}Delete it anyway?${NC} ${GR}(y/N)${NC} : ")" a
+        [[ "$a" =~ ^[Yy]$ ]] || { note "Nothing deleted."; pause; return; }
+        awk -F'|' -v r="$q" '$2!=r' "$XSUBF" > "$XSUBF.tmp" && mv "$XSUBF.tmp" "$XSUBF"
+    fi
     # remark is field 2 (new proto|remark|...) or field 1 (legacy remark|...)
     awk -F'|' -v r="$q" '{ if ($1=="vmess"||$1=="vless"||$1=="trojan") nm=$2; else nm=$1; if (nm!=r) print }' "$XACC" > "$XACC.tmp" && mv "$XACC.tmp" "$XACC"
     rebuild_config
     systemctl restart xray >/dev/null 2>&1
     ok "Account '${W}$q${NC}' deleted."
     pause
+}
+
+# Website sub accounts share a main account's key; only the name differs.
+# Nothing here edits the Xray config or restarts Xray.
+xray_sub_pick() {  # prints the chosen remark; $1 = prompt
+    local rks=() prs=() exs=() qts=() line i pick
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        parse_acct "$line"; [ -z "$P_RK" ] && continue
+        rks+=("$P_RK"); prs+=("$P_PROTO"); exs+=("${P_EXP:-never}"); qts+=("${P_QUOTA:-0}")
+    done < "$XACC"
+    [ ${#rks[@]} -gt 0 ] || { err "No V2Ray accounts yet — create one first (option 1)." >&2; return 1; }
+    for i in "${!rks[@]}"; do
+        local extra="${GR}expires ${exs[$i]}${NC}"
+        [ "${qts[$i]}" -gt 0 ] 2>/dev/null && extra="$extra ${R}· has data limit${NC}"
+        echo -e "    ${LIME}$((i+1))${NC}) ${W}${rks[$i]}${NC} ${GR}[${prs[$i]}]${NC} $extra" >&2
+    done
+    read -rp "$(echo -e "  ${P}❯${NC} $1 ${GR}(1-${#rks[@]})${NC} : ")" pick
+    [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#rks[@]} ] || { err "Invalid choice." >&2; return 1; }
+    echo "${prs[$((pick-1))]}|${rks[$((pick-1))]}|${exs[$((pick-1))]}|${qts[$((pick-1))]}"
+}
+
+xray_sub() {
+    while true; do
+        xray_paths
+        section "WEBSITE SUB ACCOUNTS" "$SKY"
+        local col="$SKY" p m any=0
+        line_top "$col"
+        for p in vmess vless trojan; do
+            m=$(awk -F'|' -v p="$p" '$1==p{r=$2} END{print r}' "$XSUBF" 2>/dev/null)
+            if [ -n "$m" ] && { grep -q "^${p}|${m}|" "$XACC" 2>/dev/null || { [ "$p" = vmess ] && grep -q "^${m}|" "$XACC" 2>/dev/null; }; }; then
+                row "$col" "$(printf '%-7s' "$(echo "$p" | tr a-z A-Z)") ${G}●${NC} main ${W}${m}${NC}"; any=1
+            else
+                row "$col" "$(printf '%-7s' "$(echo "$p" | tr a-z A-Z)") ${GR}○ not set — website can't create${NC}"
+            fi
+        done
+        line_bot "$col"
+        echo -e "  ${GR}Sub accounts use the main account's key with their own name.${NC}"
+        echo -e "  ${GR}Xray is never restarted. Deleting a sub account can't cut its user off;${NC}"
+        echo -e "  ${GR}deleting the main account stops all of its sub accounts.${NC}"
+        echo ""
+        menu_item "1" "⭐" "Choose main account (for website)" "$LIME"
+        menu_item "2" "🔗" "Make a sub-account link here"     "$SKY"
+        menu_item "3" "✖ " "Stop website sub accounts"        "$R"
+        menu_item "0" "↩ " "Back"                             "$GR"
+        echo ""
+        read -rp "$(echo -e "  ${P}❯${NC} select : ")" o
+        local pick proto rk exp quota name
+        case "$o" in
+            1)
+                echo ""; pick=$(xray_sub_pick "main account") || { pause; continue; }
+                IFS='|' read -r proto rk exp quota <<< "$pick"
+                if [ "$quota" -gt 0 ] 2>/dev/null; then
+                    err "That account has a data limit; when it runs out all sub accounts would stop."
+                    note "Pick (or create) one with unlimited data."; pause; continue
+                fi
+                mkdir -p "$(dirname "$XSUBF")"
+                { awk -F'|' -v p="$proto" '$1!=p' "$XSUBF" 2>/dev/null; echo "${proto}|${rk}"; } > "$XSUBF.tmp" \
+                    && chmod 600 "$XSUBF.tmp" && mv "$XSUBF.tmp" "$XSUBF"
+                ok "Website ${P}${proto}${NC} sub accounts now use '${W}${rk}${NC}'."
+                [ "$exp" != "never" ] && warn "It expires ${W}$exp${NC} — the website can't sell days past that date."
+                pause ;;
+            2)
+                echo ""; pick=$(xray_sub_pick "main account") || { pause; continue; }
+                IFS='|' read -r proto rk exp quota <<< "$pick"
+                read -rp "$(echo -e "  ${C}Sub-account name${NC} : ")" name
+                name=$(echo "$name" | tr -cd 'A-Za-z0-9_.-')
+                [ -n "$name" ] || { err "Name required."; pause; continue; }
+                show_links "$rk" "$name"
+                pause ;;
+            3)
+                [ "$any" -eq 1 ] || { note "No main account is set."; sleep 1; continue; }
+                read -rp "$(echo -e "  ${C}Protocol to stop${NC} ${GR}(vmess/vless/trojan)${NC} : ")" proto
+                case "$proto" in vmess|vless|trojan) ;; *) err "Invalid protocol."; pause; continue;; esac
+                awk -F'|' -v p="$proto" '$1!=p' "$XSUBF" > "$XSUBF.tmp" && mv "$XSUBF.tmp" "$XSUBF"
+                ok "The website can no longer create ${proto} sub accounts. Existing users keep working."
+                pause ;;
+            0) break ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
 }
 
 xray_menu() {
@@ -2736,6 +2830,7 @@ xray_menu() {
         menu_item "4" "▶ " "Start Xray"                      "$G"
         menu_item "5" "⏹ " "Stop Xray"                       "$Y"
         menu_item "6" "🔀" "Port 443: SSL payload ↔ V2Ray"   "$ORANGE"
+        menu_item "7" "🌐" "Website sub accounts"            "$SKY"
         menu_item "0" "↩ " "Back to main menu"              "$GR"
         echo ""
         read -rp "$(echo -e "  ${P}❯${NC} select : ")" o
@@ -2746,6 +2841,7 @@ xray_menu() {
             4) systemctl enable xray >/dev/null 2>&1; systemctl start xray >/dev/null 2>&1; ok "Xray started."; sleep 1 ;;
             5) systemctl stop xray >/dev/null 2>&1; ok "Xray stopped."; sleep 1 ;;
             6) xray_443 ;;
+            7) xray_sub ;;
             0) break ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -4484,7 +4580,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "d470238fd3b7b08ade38ecd9c694acb7f273811f5c66d71d6cef44ccfa0c299f" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "a9808dcd8fe5b716f87e0f5de937af4c4ada29f01572b03ff14b53ef269ab38a" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"
