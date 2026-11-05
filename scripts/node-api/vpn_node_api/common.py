@@ -15,7 +15,7 @@ SSH = ("ssh", "ssh-ssl", "slowdns")
 XRAY = ("vmess", "vless", "trojan")
 RESERVED = {"root", "admin", "daemon", "bin", "sys", "nobody", "sshd",
             "www-data", "ubuntu", "debian"}
-USER = re.compile(r"[a-z][a-z0-9_]{2,31}\Z")
+USER = re.compile(r"[a-z][a-z0-9_-]{2,24}\Z")
 PASSWORD = re.compile(r"[A-Za-z0-9@#%^*_+=.,:~-]{6,32}\Z")
 
 
@@ -63,7 +63,9 @@ def validate_create(body):
     if protocol not in PROTOCOLS:
         invalid("Unknown protocol")
     if not isinstance(user, str) or not USER.fullmatch(user) or user in RESERVED:
-        invalid("Invalid or reserved username")
+        invalid("Username must be 3–25 characters including the prefix, start with a lowercase "
+                "letter, and contain only lowercase letters, digits, underscores or hyphens; "
+                "reserved usernames are not allowed")
     days(body.get("duration_days"))
     if body.get("options", {}) != {}:
         invalid("This node supports empty options only")

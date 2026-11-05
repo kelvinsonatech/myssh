@@ -145,7 +145,7 @@ class Contract(unittest.TestCase):
         for protocol in ("ssh", "ssh-ssl", "slowdns"):
             with self.subTest(protocol=protocol):
                 body = {**self.body(), "protocol": protocol, "duration_days": 1,
-                        "username": "api_" + protocol.replace("-", "_")}
+                        "username": ("api-" + protocol).ljust(25, "x")}
                 calls = []
                 def command(argv, data=None, **kwargs):
                     self.assertIn(argv[0], ("useradd", "chpasswd", "chage"))
@@ -163,6 +163,7 @@ class Contract(unittest.TestCase):
                     self.assertEqual(account["created_at"], "2099-12-30T20:00:00Z")
                     self.assertEqual(account["expires_at"], "2099-12-31T20:00:00Z")
                     self.assertEqual(calls[0][0:3], ["useradd", "-e", "2100-01-01"])
+                    self.assertEqual(calls[0][-1], body["username"])
                     self.native.ssh_operation("renew", account)
                     self.assertEqual(calls[-1], ["chage", "-E", "2100-01-01", body["username"]])
                 self.assertEqual(self.account_file.read_text(), self.original)
@@ -245,6 +246,34 @@ class Contract(unittest.TestCase):
             with patch.object(native, "run") as command:
                 native.ssh_operation("renew", account)
                 command.assert_called_once_with(["chage", "-E", safety, "api_fixture"])
+
+    def test_prefixed_usernames_preserve_names_and_enforce_length(self):
+        from vpn_node_api.common import validate_create, PROTOCOLS
+        for protocol in PROTOCOLS:
+            for name in ("litronssh-jodnf", "gh-joe", "gh_joe", "gh-" + "a" * 22):
+                validate_create({**self.body(), "protocol": protocol, "username": name})
+            for name in ("gh-" + "a" * 23, "-joe", "gh joe", "gh:joe",
+                         "gh/joe", "gh;joe", "gh\njoe", "GH-joe", "ab", "root"):
+                with self.assertRaises(Fault):
+                    validate_create({**self.body(), "protocol": protocol, "username": name})
+        for name in ("gh-" + "a" * 22, "uk-" + "a" * 22):
+            body = {**self.body(), "username": name}
+            response = self.request("POST", "/api/v1/accounts", body, body["request_id"])
+            self.assertEqual(response.status_code, 201, response.text)
+            account = response.json()["data"]["account"]
+            self.assertEqual(account["username"], name)
+            path = "/api/v1/accounts/" + account["account_id"]
+            self.assertEqual(self.request("GET", path).json()["data"]["account"]["username"], name)
+            renew = {"request_id": str(uuid.uuid4()), "duration_days": 1}
+            self.assertEqual(self.request("POST", path + "/renew", renew, renew["request_id"]).status_code, 200)
+            duplicate = {**body, "request_id": str(uuid.uuid4())}
+            self.assertEqual(self.request("POST", "/api/v1/accounts", duplicate,
+                                          duplicate["request_id"]).status_code, 409)
+            self.assertEqual(self.request("DELETE", path, key=str(uuid.uuid4())).status_code, 200)
+        before = self.account_file.read_bytes()
+        body = {**self.body(), "username": "gh-" + "a" * 23}
+        self.assertEqual(self.request("POST", "/api/v1/accounts", body, body["request_id"]).status_code, 422)
+        self.assertEqual(self.account_file.read_bytes(), before)
 
     def test_invalid_username_and_password_do_not_mutate(self):
         for changes in ({"username": "root"}, {"username": "a; reboot"},

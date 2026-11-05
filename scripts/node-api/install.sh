@@ -30,7 +30,7 @@ while read -r digest name; do
     printf '%s  %s\n' "$digest" "$work/vpn_node_api/$name" | sha256sum -c - >/dev/null
 done <<'API_MANIFEST'
 38255a5cad87aaee175ba8166f834059a82818a80ef1d4f437e562451de51e26 access.py
-51ee3ec2ffc1065eaa90dab2e7f3e4ef4f1de873c72f18e8e0c85187ba1d1748 common.py
+c95fd037c66bf6d5bc56a684784deb1b08c6d2b5a8e52df3cd0227cf2e248314 common.py
 1f5587d0438e3da8f57b9fc4b647cae464ed9e03d5b37e25694222dc8c366542 control.py
 105f9ec151890a163fadc5000e64bce719da340828a173784ffc6650c4a3763a engine.py
 c3aab49d5737fe2ff35aac10dbaf81fcdfe208d180f019d89ca5b80af4af43c5 __init__.py
