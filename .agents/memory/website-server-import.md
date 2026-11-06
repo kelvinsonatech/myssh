@@ -8,6 +8,8 @@ separator lines or footer.
 Preserve the exact labels and order. Server provider must be blank.
 Country, city and region should be discovered automatically, with stable
 generated server and URL names; no extra location/name questions.
+Server name is only the country name (e.g. France). URL name is the lowercase
+country code, a dash and two random digits (e.g. fr-27), saved for stable exports.
 Maximum accounts is the only additional activation question.
 
 **Why:** the user's website imports this text instead of requiring manual

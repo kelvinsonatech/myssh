@@ -30,7 +30,8 @@ class ServerDetails(unittest.TestCase):
 
     def test_exact_format_persistence_and_no_config_changes(self):
         before = copy.deepcopy(self.cfg)
-        with patch.object(details, "locate", return_value=self.geo) as lookup:
+        with patch.object(details, "locate", return_value=self.geo) as lookup, \
+             patch.object(details.secrets, "randbelow", return_value=17) as random:
             outputs = []
             for _ in range(2):
                 out = io.StringIO()
@@ -38,10 +39,10 @@ class ServerDetails(unittest.TestCase):
                     details.export_details(self.cfg, self.root)
                 outputs.append(out.getvalue())
             lookup.assert_called_once_with("203.0.113.25")
+            random.assert_called_once_with(90)
         digest = hashlib.sha256(b"fixture").hexdigest().upper()
-        suffix = hashlib.sha256(b"203.0.113.25").hexdigest()[:8]
         expected = (
-            f"Server name: Germany {suffix.upper()}\nCountry: DE\nURL name: de-{suffix}\n"
+            "Server name: Germany\nCountry: DE\nURL name: de-27\n"
             "City: Frankfurt\nRegion: Hesse\nPublic hostname: de.example.com\n"
             "Server IP: 203.0.113.25\nMaximum accounts: 300\nServer provider: \n"
             "API URL: https://de.example.com:9443/api/v1\nKey ID: test-key\n"
@@ -53,7 +54,7 @@ class ServerDetails(unittest.TestCase):
         self.assertEqual((self.root / "server-details.json").stat().st_mode & 0o777, 0o600)
         self.assertNotIn(self.cfg["secret"], (self.root / "server-details.json").read_text())
 
-    def test_offline_then_retry_keeps_names_stable(self):
+    def test_offline_then_retry_uses_discovered_country(self):
         path = self.root / "server-details.json"
         with patch.object(details, "locate", return_value=None), \
              contextlib.redirect_stderr(io.StringIO()) as warnings:
@@ -62,9 +63,26 @@ class ServerDetails(unittest.TestCase):
         self.assertNotIn("country", first)
         with patch.object(details, "locate", return_value=self.geo):
             second = details.metadata(self.cfg, path)
-        self.assertEqual(first["server_name"], second["server_name"])
-        self.assertEqual(first["url_name"], second["url_name"])
+        self.assertEqual(first["server_name"], "Server")
+        self.assertRegex(first["url_name"], r"^node-[0-9]{2}$")
+        self.assertEqual(second["server_name"], "Germany")
+        self.assertRegex(second["url_name"], r"^de-[0-9]{2}$")
         self.assertEqual(second["country"], "DE")
+
+    def test_existing_generated_names_migrate_once(self):
+        path = self.root / "server-details.json"
+        old = dict(self.geo, server_name="Germany ABCD1234", url_name="de-abcd1234")
+        path.write_text(json.dumps(old))
+        before = copy.deepcopy(self.cfg)
+        with patch.object(details, "locate") as lookup, \
+             patch.object(details.secrets, "randbelow", return_value=89) as random:
+            first = details.metadata(self.cfg, path)
+            second = details.metadata(self.cfg, path)
+        lookup.assert_not_called()
+        random.assert_called_once_with(90)
+        self.assertEqual(first, second)
+        self.assertEqual(first, dict(self.geo, server_name="Germany", url_name="de-99"))
+        self.assertEqual(self.cfg, before)
 
     def test_lookup_fallback_and_untrusted_values(self):
         fallback = dict(ip=self.cfg["public_ip"], country_code="DE", country_name="Germany",

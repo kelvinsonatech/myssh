@@ -4,6 +4,7 @@ import ipaddress
 import json
 from pathlib import Path
 import re
+import secrets
 import ssl
 import sys
 import urllib.request
@@ -57,10 +58,13 @@ def metadata(cfg, path):
         else:
             print("Warning: location lookup unavailable; Country, City and Region are blank. "
                   "Run export again later. No location was guessed.", file=sys.stderr)
-    if not saved.get("server_name") or not saved.get("url_name"):
-        suffix = hashlib.sha256(cfg["public_ip"].encode()).hexdigest()[:8]
-        saved["server_name"] = f"{saved.get('country_name', 'Server')} {suffix.upper()}"
-        saved["url_name"] = f"{saved.get('country', 'node').lower()}-{suffix}"
+    country_name = saved.get("country_name", "Server")
+    prefix = saved.get("country", "node").lower()
+    if saved.get("server_name") != country_name:
+        saved["server_name"] = country_name
+        changed = True
+    if not re.fullmatch(re.escape(prefix) + r"-[0-9]{2}", saved.get("url_name", "")):
+        saved["url_name"] = f"{prefix}-{secrets.randbelow(90) + 10}"
         changed = True
     if changed:
         write_json(path, saved)
