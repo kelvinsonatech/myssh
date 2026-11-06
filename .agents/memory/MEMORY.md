@@ -11,3 +11,4 @@
 - [Multi-login limiter](login-limiter.md) — API menu only (17→7); engine embedded verbatim; API reports bans as status "disabled" + disabled_reason; never restarts VPN services.
 - [V2Ray website sub accounts](v2ray-sub-accounts.md) — API shares a menu-chosen main account key; never touches/restarts Xray; subs not individually revocable (user accepted).
 - [Website username prefixes](username-prefixes.md) — hyphenated prefixes supported; max 25 total characters, never silently truncate names.
+- [Website server import](website-server-import.md) — exact LitronSSH block; auto location/names, blank provider, only added prompt is maximum accounts.

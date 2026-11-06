@@ -4646,6 +4646,7 @@ node_api_menu() {
         echo "  5  Allowed IPs / whitelist"
         echo "  6  Update script"
         echo "  7  Multi-login limiter"
+        echo "  8  Website import block (contains secret)"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4657,7 +4658,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "57f6a7d9c7332ec1b667524b0d4ae2fdb3c9962d0fb81b24aed3d004196ab5d6" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "3d336522dad07632a14ae0b57c74f4ef1caf3236fa4f6e242fba4bd269702d14" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"
@@ -4676,6 +4677,7 @@ node_api_menu() {
                 pause;;
             6) script_update_menu;;
             7) limiter_menu;;
+            8) /usr/local/bin/vpn-node-api export; pause;;
             0|"") return;;
             *) err "Invalid option.";;
         esac

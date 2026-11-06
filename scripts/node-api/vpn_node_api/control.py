@@ -122,6 +122,18 @@ node_api_menu() {
             if "vpn-node-api whitelist" not in block:
                 raise ValueError("Cannot safely extend the API submenu")
             text = text[:start] + block + text[end:]
+    if "node_api_menu() {" in text:
+        start = text.index("node_api_menu() {")
+        end = text.index("\n}\n", start) + 3
+        block = text[start:end]
+        if "vpn-node-api export" not in block:
+            block = block.replace('        echo "  0  Back"',
+                                  '        echo "  8  Website import block (contains secret)"\n        echo "  0  Back"')
+            block = block.replace('            0|"") return;;',
+                                  '            8) /usr/local/bin/vpn-node-api export; pause;;\n            0|"") return;;')
+            if "vpn-node-api export" not in block:
+                raise ValueError("Cannot safely add website import output to the API menu")
+            text = text[:start] + block + text[end:]
     return text
 
 
@@ -273,10 +285,12 @@ def install():
     ip = str(ipaddress.IPv4Address(input("Server public IPv4: ").strip()))
     website = str(ipaddress.IPv4Address(input("Website outgoing IPv4 (only this IP may call API): ").strip()))
     port = int(input("API TCP port [9443]: ").strip() or "9443")
+    maximum = prompt_max_accounts()
     stage("Checking TCP port and existing firewall rules")
     guard = require_safe_port(port)
     cfg = {"hostname": host, "public_ip": ip, "port": port, "website_ips": [website],
-           "key_id": "node-" + secrets.token_hex(4), "secret": secrets.token_hex(32)}
+           "key_id": "node-" + secrets.token_hex(4), "secret": secrets.token_hex(32),
+           "max_accounts": maximum}
     try:
         # Complete the fallible network/package step before creating permanent
         # API files. A failed download can be retried without deleting anything.
@@ -343,9 +357,14 @@ def install():
         else:
             raise ValueError("API did not open its port; inspect journalctl -u vpn-node-api")
         status()
-        print("API secret (shown once; store securely):", cfg["secret"])
+        try:
+            export()
+        except (OSError, ValueError):
+            # Optional display must never roll back a successfully running API.
+            print("API is active, but the import block could not be generated. "
+                  "Run vpn-node-api export to retry.", file=sys.stderr)
         print("Ready adapters: SSH, SSH SSL, SlowDNS, Hysteria 2 when installed and active.")
-        print("Xray, Hysteria 1 and ZIVPN creation remain blocked: no verified live migration.")
+        print("V2Ray and ZIVPN need a main shared account selected in their menus. Hysteria 1 remains blocked.")
         print("No VPN services were restarted. Existing cron jobs were not changed.")
     except Exception:
         guard.close()
@@ -369,6 +388,23 @@ def api_ready(port):
     return bool(re.search(rf"\bpid={pid},", listeners))
 
 
+def prompt_max_accounts():
+    while True:
+        value = input("Maximum API accounts [300; 0 = unlimited]: ").strip() or "300"
+        if value.isascii() and value.isdigit() and len(value) <= 9:
+            return int(value)
+        print("Enter a nonnegative whole number (0 means unlimited).")
+
+
+def export():
+    from .server_details import export_details
+    # Serialize metadata creation only. Existing config and credentials stay untouched.
+    with account_lock(str(CONFIG.parent / "server-details.lock")):
+        print("Private import block: contains your existing API secret. Keep it secure.",
+              file=sys.stderr)
+        export_details(config(), CONFIG.parent)
+
+
 def status():
     cfg = config()
     certificate = Path(cfg["certificate"]).read_text()
@@ -383,7 +419,7 @@ def status():
     print("Key ID:", cfg["key_id"])
     print("Certificate SHA-256:", fingerprint)
     print("Allowed website IPv4:", ", ".join(cfg["website_ips"]))
-    print("Secret hidden; use rotate if you need a new credential.")
+    print("Secret hidden; run vpn-node-api export for the private website import block.")
 
 
 def whitelist(operation=None, source=None):
@@ -432,7 +468,7 @@ def update(menu_path=Path("/usr/local/bin/menu")):
     if source == destination.resolve():
         raise ValueError("Run the downloaded API-only installer with --update-api")
     names = ("__init__.py", "__main__.py", "common.py", "engine.py", "native.py",
-             "links.py", "server.py", "control.py", "access.py")
+             "links.py", "server.py", "control.py", "access.py", "server_details.py")
     contents = {name: (source / name).read_text() for name in names}
     for name, content in contents.items():
         compile(content, name, "exec")
@@ -470,7 +506,7 @@ def update(menu_path=Path("/usr/local/bin/menu")):
         raise
     print("API files updated. Account data, secrets and VPN configurations preserved.")
     print("Run: vpn-node-api status")
-    print("Close and reopen menu to see option 17 → 5 (Allowed IPs / whitelist).")
+    print("Run vpn-node-api export for the website import block, or use API menu option 8.")
     return active
 
 
@@ -479,7 +515,7 @@ def main():
     os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "status", "rotate", "firewall-up",
-                                          "disable", "pending", "whitelist", "update"))
+                                          "disable", "pending", "whitelist", "update", "export"))
     parser.add_argument("operation", nargs="?", choices=("list", "add", "remove"))
     parser.add_argument("source", nargs="?")
     args = parser.parse_args()
@@ -501,6 +537,8 @@ def main():
             whitelist(args.operation, args.source)
         elif args.action == "status":
             status()
+        elif args.action == "export":
+            export()
         elif args.action == "pending":
             from .common import Store
             store = Store("/var/lib/vpn-node-api")
