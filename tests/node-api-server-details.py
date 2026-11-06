@@ -41,13 +41,12 @@ class ServerDetails(unittest.TestCase):
         digest = hashlib.sha256(b"fixture").hexdigest().upper()
         suffix = hashlib.sha256(b"203.0.113.25").hexdigest()[:8]
         expected = (
-            "===== LitronSSH server details =====\n"
             f"Server name: Germany {suffix.upper()}\nCountry: DE\nURL name: de-{suffix}\n"
             "City: Frankfurt\nRegion: Hesse\nPublic hostname: de.example.com\n"
             "Server IP: 203.0.113.25\nMaximum accounts: 300\nServer provider: \n"
             "API URL: https://de.example.com:9443/api/v1\nKey ID: test-key\n"
             "API secret: test-only-secret\nCertificate SHA-256: "
-            + ":".join(digest[i:i+2] for i in range(0,64,2)) + "\n===== end =====\n"
+            + ":".join(digest[i:i+2] for i in range(0,64,2)) + "\n"
         )
         self.assertEqual(outputs, [expected, expected])
         self.assertEqual(self.cfg, before)

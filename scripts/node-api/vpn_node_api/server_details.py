@@ -90,7 +90,5 @@ def export_details(cfg, directory):
         ("API secret", cfg["secret"]),
         ("Certificate SHA-256", fingerprint),
     ]
-    print("===== LitronSSH server details =====")
     for label, value in fields:
         print(f"{label}: {clean(value, None)}")
-    print("===== end =====")

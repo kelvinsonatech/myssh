@@ -2,8 +2,9 @@
 name: Website server import output
 description: User's LitronSSH import format, automatic metadata and privacy requirements
 ---
-The user imports servers by pasting a block headed
-`===== LitronSSH server details =====` and ending `===== end =====`.
+The user imports servers by pasting plain field lines starting with
+`Server name:` and ending with `Certificate SHA-256:`. No heading, branding,
+separator lines or footer.
 Preserve the exact labels and order. Server provider must be blank.
 Country, city and region should be discovered automatically, with stable
 generated server and URL names; no extra location/name questions.
