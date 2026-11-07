@@ -2608,8 +2608,8 @@ xray_open_ports() {
 
 xray_install() {
     [ -f "$XBIN" ] && return 0
-    note "Installing Xray-core (needs internet)..."
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
+    note "Installing Xray-core v26.3.27 (needs internet)..."
+    bash -c "$(curl -fLsS https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version v26.3.27 >/dev/null 2>&1
     [ -f "$XBIN" ]
 }
 
