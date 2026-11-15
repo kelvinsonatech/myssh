@@ -13,3 +13,4 @@
 - [V2Ray website sub accounts](v2ray-sub-accounts.md) — API shares a menu-chosen main account key; never touches/restarts Xray; subs not individually revocable (user accepted).
 - [Website username prefixes](username-prefixes.md) — hyphenated prefixes supported; max 25 total characters, never silently truncate names.
 - [Website server import](website-server-import.md) — exact LitronSSH block; auto location/names, blank provider, only added prompt is maximum accounts.
+- [Server domain changes](domain-change.md) — preserve protocols, accounts and ports; stage certificates, roll back failures, leave SlowDNS delegation separate.

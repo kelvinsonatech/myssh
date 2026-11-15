@@ -5507,6 +5507,218 @@ limiter_menu() {
     done
 }
 
+change_server_domain() {
+    # Keep this helper inside the menu so menu-only updates install it too.
+    local helper
+    helper=$(mktemp) || return
+    chmod 600 "$helper"
+    cat > "$helper" <<'DOMPY'
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+
+def run(*args):
+    return subprocess.run(list(args), check=True, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=180)
+
+def active(service):
+    return subprocess.run(["systemctl", "is-active", "--quiet", service]).returncode == 0
+
+def atomic(path, data, mode=0o600, uid=0, gid=0):
+    path = Path(path)
+    fd, temp = tempfile.mkstemp(prefix=".domain-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temp, mode)
+        os.chown(temp, uid, gid)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+def certificate(cert, key, host):
+    result = run("openssl", "x509", "-in", str(cert), "-checkhost", host, "-noout")
+    if "does match certificate" not in result.stdout:
+        raise ValueError("Certificate does not match the new domain.")
+    run("openssl", "x509", "-in", str(cert), "-checkend", "86400", "-noout")
+    ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key)
+
+def main():
+    if os.geteuid() != 0:
+        raise ValueError("Run as root.")
+    domain = Path("/etc/ssh-panel/domain.conf")
+    old = domain.read_text().strip()
+    new = input("New server domain (no https:// or port): ").strip().lower()
+    labels = new.split(".")
+    if len(labels) < 2 or len(new) > 253 or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels
+    ):
+        raise ValueError("Enter a valid DNS hostname.")
+    try:
+        ipaddress.ip_address(new)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Enter a domain, not an IP address.")
+    if new == old:
+        print("This domain is already selected. Nothing changed.")
+        return
+    expected = str(ipaddress.ip_address(Path("/etc/ssh-panel/ip.conf").read_text().strip()))
+    addresses = {x[4][0] for x in socket.getaddrinfo(new, 80, type=socket.SOCK_STREAM)}
+    if addresses != {expected}:
+        raise ValueError("DNS must point directly and only to this server's saved IP. "
+                         "Remove proxy/CDN or mismatched A/AAAA records before retrying.")
+    cfgpath = Path("/etc/vpn-node-api/config.json")
+    api = json.loads(cfgpath.read_text()) if cfgpath.exists() else None
+    move_api = api is not None and api.get("hostname") in (old, expected)
+    xconf = Path("/usr/local/etc/xray/config.json")
+    xray = json.loads(xconf.read_text()) if xconf.exists() else None
+    pairs = []
+    if xray:
+        for inbound in xray.get("inbounds", []):
+            stream = inbound.get("streamSettings", {})
+            if stream.get("security") not in (None, "none", "tls", "reality"):
+                raise ValueError("Custom Xray TLS configuration requires manual review.")
+            for pair in stream.get("tlsSettings", {}).get("certificates", []):
+                if not pair.get("certificateFile") or not pair.get("keyFile"):
+                    raise ValueError("Inline/custom Xray certificates require manual review.")
+                pairs.append(pair)
+    stunnel = Path("/etc/stunnel/stunnel.conf")
+    if not stunnel.exists() or not re.search(
+        r"(?m)^\s*cert\s*=\s*/etc/stunnel/stunnel\.pem\s*$", stunnel.read_text()
+    ):
+        raise ValueError("Custom or missing stunnel certificate configuration; nothing changed.")
+    services = ["stunnel4"] + (["xray"] if pairs else []) + (["vpn-node-api"] if move_api else [])
+    running = [s for s in services if active(s)]
+    print("Change:", old or "(IP only)", "->", new)
+    print("Preserved: accounts, ports, protocol choices, API keys and limits.")
+    print("SlowDNS nameserver/delegation and separate API hostnames stay unchanged.")
+    print("Certificate issuance may briefly interrupt port-80 payload connections.")
+    print("Services to restart after switching:", ", ".join(running) or "none")
+    print("Existing client links must be updated. Keep the old DNS records during migration.")
+    if move_api:
+        print("Website API will use the new domain; re-import its URL and certificate fingerprint.")
+    if input("Type CHANGE to proceed: ").strip() != "CHANGE":
+        print("Cancelled. Nothing changed.")
+        return
+
+    cert = Path("/etc/letsencrypt/live") / new / "fullchain.pem"
+    key = cert.parent / "privkey.pem"
+    try:
+        certificate(cert, key, new)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if not shutil.which("certbot"):
+            raise ValueError("certbot is not installed. No domain settings changed.")
+        # Never stop an unknown port-80 owner or any other protocol.
+        listeners = run("ss", "-ltnpH", "sport = :80").stdout.strip()
+        ws = active("ws-proxy")
+        if listeners and (not ws or any('"ws-proxy"' not in line and
+                '"python3"' not in line for line in listeners.splitlines())):
+            raise ValueError("Port 80 has an unrecognized owner. Nothing changed.")
+        try:
+            if ws:
+                run("systemctl", "stop", "ws-proxy")
+            if run("ss", "-ltnH", "sport = :80").stdout.strip():
+                raise ValueError("Port 80 is still occupied; certificate request cancelled.")
+            run("certbot", "certonly", "--standalone", "--non-interactive",
+                "--agree-tos", "--register-unsafely-without-email", "-d", new)
+        finally:
+            if ws:
+                run("systemctl", "start", "ws-proxy")
+        certificate(cert, key, new)
+
+    changes = {domain: (new + "\n").encode(),
+               Path("/etc/stunnel/stunnel.pem"): cert.read_bytes() + b"\n" + key.read_bytes()}
+    owner = {}
+    if pairs:
+        user = run("systemctl", "show", "-p", "User", "--value", "xray").stdout.strip() or "root"
+        userinfo = pwd.getpwnam(user)
+        xc, xk = Path("/etc/xray/domain.crt"), Path("/etc/xray/domain.key")
+        changes[xc], changes[xk] = cert.read_bytes(), key.read_bytes()
+        owner[xc] = owner[xk] = (userinfo.pw_uid, userinfo.pw_gid)
+        for pair in pairs:
+            pair["certificateFile"], pair["keyFile"] = str(xc), str(xk)
+        changes[xconf] = (json.dumps(xray, indent=2) + "\n").encode()
+    if move_api:
+        # Only endpoint/certificate references change; no credentials or account edits.
+        ac, ak = cfgpath.parent / "domain.crt", cfgpath.parent / "domain.key"
+        changes[ac], changes[ak] = cert.read_bytes(), key.read_bytes()
+        api.update(hostname=new, certificate=str(ac), private_key=str(ak))
+        changes[cfgpath] = (json.dumps(api, indent=2) + "\n").encode()
+
+    backup = Path(tempfile.mkdtemp(prefix="domain-change-", dir=domain.parent))
+    os.chmod(backup, 0o700)
+    originals = {}
+    for index, path in enumerate(changes):
+        if path.is_symlink():
+            raise ValueError("Refusing to replace a symlink: " + str(path))
+        if path.exists():
+            stat = path.stat()
+            originals[path] = (path.read_bytes(), stat.st_mode & 0o777, stat.st_uid, stat.st_gid)
+            shutil.copy2(path, backup / str(index))
+        else:
+            originals[path] = None
+    (backup / "paths.json").write_text(json.dumps([str(p) for p in changes]))
+    try:
+        for path, data in changes.items():
+            previous = originals[path]
+            uid, gid = owner.get(path, (previous[2], previous[3]) if previous else (0, 0))
+            atomic(path, data, previous[1] if previous else 0o600, uid, gid)
+        if pairs:
+            run("/usr/local/bin/xray", "run", "-test", "-config", str(xconf))
+        for service in running:
+            run("systemctl", "restart", service)
+        time.sleep(2)
+        if any(not active(s) for s in running):
+            raise ValueError("A changed service did not stay running.")
+    except BaseException:
+        for path, previous in originals.items():
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic(path, *previous)
+        for service in running:
+            try:
+                run("systemctl", "restart", service)
+            except subprocess.SubprocessError:
+                print("WARNING: could not restart", service, "after rollback; check its logs.")
+        print("Previous domain settings restored. Backup:", backup)
+        raise
+    print("Domain changed to", new, "\nBackup:", backup)
+    print("Update client server/SNI fields to the new domain; credentials are unchanged.")
+    if move_api:
+        print("Run vpn-node-api export and update the website server entry.")
+    print("SlowDNS delegation and independent UDP certificates were not changed.")
+
+if __name__ == "__main__":
+    try:
+        with open("/run/lock/vpn-node-accounts.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            main()
+    except (Exception, KeyboardInterrupt) as error:
+        print("Domain change stopped:", str(error))
+        raise SystemExit(1)
+DOMPY
+    python3 "$helper"
+    rm -f "$helper"
+    DOMAIN=$(cat "$CONF_DIR/domain.conf" 2>/dev/null)
+    HOST_DISPLAY="${DOMAIN:-$SERVER_IP}"
+    pause
+}
+
 script_update_menu() {
     section "SCRIPT UPDATES" "$TEAL"
     note "Fetching the updater securely. Server setup will NOT run."
@@ -5564,6 +5776,7 @@ while true; do
     menu_item "16" "◇" "ZIVPN (isolated UDP)"      "$TEAL"
     menu_item "17" "◇" "Website API (HTTPS)"        "$SKY"
     menu_item "18" "↻" "Update script"               "$TEAL"
+    menu_item "19" "◇" "Change server domain"        "$SKY"
     menu_item "0" "🚪" "Exit"                     "$GR"
     echo ""
     read -rp "$(echo -e "  ${P}❯${NC} select an option : ")" OPT
@@ -5586,6 +5799,7 @@ while true; do
         16) zi_menu ;;
         17) node_api_menu ;;
         18) script_update_menu ;;
+        19) change_server_domain ;;
         0) clear; echo -e "  ${G}Goodbye 👋${NC}\n"; exit 0 ;;
         *) echo -e "  ${R}Invalid option.${NC}"; sleep 1 ;;
     esac
