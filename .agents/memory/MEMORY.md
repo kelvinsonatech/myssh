@@ -14,3 +14,4 @@
 - [Website username prefixes](username-prefixes.md) — hyphenated prefixes supported; max 25 total characters, never silently truncate names.
 - [Website server import](website-server-import.md) — exact LitronSSH block; auto location/names, blank provider, only added prompt is maximum accounts.
 - [Server domain changes](domain-change.md) — preserve protocols, accounts and ports; stage certificates, roll back failures, leave SlowDNS delegation separate.
+- [SSH login banner](ssh-banner.md) — API-gated HTML for simple SSH, WebSocket and SSL; preserve toggle on updates, use authentication banner rather than stream injection.

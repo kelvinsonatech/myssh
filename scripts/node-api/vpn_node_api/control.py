@@ -1,4 +1,4 @@
-"""Root-only administration; intentionally never controls VPN service units."""
+"""Root-only API administration; optional SSH banner uses validated reload only."""
 import argparse
 import hashlib
 import ipaddress
@@ -16,7 +16,7 @@ import tempfile
 import urllib.request
 
 from .common import account_lock, atomic, write_json
-from . import access
+from . import access, banner
 
 CONFIG = Path("/etc/vpn-node-api/config.json")
 HOME = Path("/opt/vpn-node-api")
@@ -133,6 +133,18 @@ node_api_menu() {
                                   '            8) /usr/local/bin/vpn-node-api export; pause;;\n            0|"") return;;')
             if "vpn-node-api export" not in block:
                 raise ValueError("Cannot safely add website import output to the API menu")
+            text = text[:start] + block + text[end:]
+    if "node_api_menu() {" in text:
+        start = text.index("node_api_menu() {")
+        end = text.index("\n}\n", start) + 3
+        block = text[start:end]
+        if "vpn-node-api banner" not in block:
+            block = block.replace('        echo "  0  Back"',
+                                  '        echo "  9  SSH banner (on / off)"\n        echo "  0  Back"')
+            block = block.replace('            0|"") return;;',
+                                  '            9) /usr/local/bin/vpn-node-api banner; pause;;\n            0|"") return;;')
+            if "vpn-node-api banner" not in block:
+                raise ValueError("Cannot safely add the SSH banner menu")
             text = text[:start] + block + text[end:]
     return text
 
@@ -375,6 +387,8 @@ def install():
         if CONFIG.exists():
             firewall_down(cfg)
         raise
+    # Only after successful API activation; never on a code update or ordinary install.
+    banner.auto_enable()
 
 
 def api_ready(port):
@@ -468,7 +482,7 @@ def update(menu_path=Path("/usr/local/bin/menu")):
     if source == destination.resolve():
         raise ValueError("Run the downloaded API-only installer with --update-api")
     names = ("__init__.py", "__main__.py", "common.py", "engine.py", "native.py",
-             "links.py", "server.py", "control.py", "access.py", "server_details.py")
+             "links.py", "server.py", "control.py", "access.py", "server_details.py", "banner.py")
     contents = {name: (source / name).read_text() for name in names}
     for name, content in contents.items():
         compile(content, name, "exec")
@@ -515,7 +529,7 @@ def main():
     os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "status", "rotate", "firewall-up",
-                                          "disable", "pending", "whitelist", "update", "export"))
+                                          "disable", "pending", "whitelist", "update", "export", "banner"))
     parser.add_argument("operation", nargs="?", choices=("list", "add", "remove"))
     parser.add_argument("source", nargs="?")
     args = parser.parse_args()
@@ -533,6 +547,9 @@ def main():
             if active:
                 run(["systemctl", "start", "vpn-node-api.service"], timeout=25)
             status()
+        elif args.action == "banner":
+            with account_lock("/run/lock/vpn-node-api-install.lock"):
+                banner.menu()
         elif args.action == "whitelist":
             whitelist(args.operation, args.source)
         elif args.action == "status":

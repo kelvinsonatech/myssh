@@ -4647,6 +4647,7 @@ node_api_menu() {
         echo "  6  Update script"
         echo "  7  Multi-login limiter"
         echo "  8  Website import block (contains secret)"
+        echo "  9  SSH banner (on / off)"
         echo "  0  Back"
         read -rp "  Select: " choice
         case "$choice" in
@@ -4658,7 +4659,7 @@ node_api_menu() {
                     if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
                         "https://raw.githubusercontent.com/kelvinsonatech/myssh/replit-agent/scripts/node-api/install.sh" \
                         -o "$work" &&
-                       printf '%s  %s\n' "e597a642be98a27e5d6230245bb0aa910382fd21143c1ba101d2802786fe0324" "$work" | sha256sum -c - >/dev/null; then
+                       printf '%s  %s\n' "22c7bfa2d894e8d7f3b39b7428df8a8be7bc28c09b092c9491f32f9ca99a3adc" "$work" | sha256sum -c - >/dev/null; then
                         bash "$work" || err "API setup stopped; VPN services were not restarted."
                     else err "Download/verification failed; nothing executed."; fi
                     rm -f "$work"
@@ -4678,6 +4679,13 @@ node_api_menu() {
             6) script_update_menu;;
             7) limiter_menu;;
             8) /usr/local/bin/vpn-node-api export; pause;;
+            9)
+                if [ -f /opt/vpn-node-api/vpn_node_api/banner.py ]; then
+                    /usr/local/bin/vpn-node-api banner
+                else
+                    err "Update the API first to install banner support. Do not rerun full server setup."
+                fi
+                pause;;
             0|"") return;;
             *) err "Invalid option.";;
         esac
